@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>无感翻译跨应用选区测试</title>
+  <style>
+    :root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, sans-serif; }
+    body { max-width: 920px; margin: 48px auto; padding: 0 28px; line-height: 1.65; }
+    h1 { font-size: 30px; }
+    .card { margin: 20px 0; padding: 22px; border: 1px solid #8a8a8a66; border-radius: 16px; font-size: 20px; }
+    .label { display: block; margin-bottom: 8px; font-size: 13px; font-weight: 700; opacity: .65; }
+    textarea { box-sizing: border-box; width: 100%; min-height: 130px; padding: 16px; font: inherit; line-height: 1.5; border-radius: 12px; }
+  </style>
+</head>
+<body>
+  <h1>无感翻译跨应用选区测试</h1>
+  <p>分别选中下面的整句文字，验证语言路由、浮层位置、复制和可写选区替换。</p>
+
+  <section class="card" id="english-readonly">
+    <span class="label">只读英文 → 应翻译为简体中文</span>
+    The universal translator should detect this selected English sentence without scanning the entire webpage or moving the mouse pointer.
+  </section>
+
+  <section class="card" id="chinese-readonly">
+    <span class="label">只读中文 → 应翻译为英文</span>
+    这个跨应用翻译工具应该只读取当前选中的中文句子，并在选区附近显示英文译文。
+  </section>
+
+  <section class="card" id="japanese-readonly">
+    <span class="label">只读日文 → 应翻译为简体中文</span>
+    この翻訳ツールは選択した日本語の文章を認識し、中国語の訳文を近くに表示します。
+  </section>
+
+  <section class="card" id="editable-selection">
+    <span class="label">可编辑英文 → 翻译后应允许安全替换</span>
+    <textarea>The editable selection should be translated into Chinese and replaced only after the original text is verified.</textarea>
+  </section>
+</body>
+</html>

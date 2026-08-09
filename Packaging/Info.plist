@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>ClaudePromptTranslator</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>local.codex.ClaudePromptTranslator</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>无感翻译</string>
+	<key>CFBundleDisplayName</key>
+	<string>无感翻译</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.7.0</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>local.codex.ClaudePromptTranslator</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>claude-prompt-translator</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>7</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>15.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>跨应用选区翻译工具；本地优先并保护原选区与剪贴板。</string>
+</dict>
+</plist>
