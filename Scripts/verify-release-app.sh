@@ -101,6 +101,7 @@ for FORBIDDEN_MARKER in \
   '--self-test-selection' \
   '--self-test-inline' \
   '--self-test-response' \
+  'CPTDebugSelection' \
   'CPT_DEBUG_SELECTION' \
   'CPT_DEBUG_SELECTION_PID' \
   'CPT_DEBUG_DELIVERY' \

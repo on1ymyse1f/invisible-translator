@@ -16,7 +16,7 @@ enum SelectionDiagnostics {
 #if DEBUG
         true
 #else
-        UserDefaults.standard.bool(forKey: "CPTDebugSelection")
+        false
 #endif
     }
 
@@ -613,10 +613,29 @@ final class UniversalTextSelection {
         )
     }
 
-    func replace(with replacement: String) async throws {
+    /// Returns a non-replaceable projection for local relevance filtering.
+    /// Filtering is intentionally applied only to read-only captures so a
+    /// translated subset can never overwrite a larger editable selection.
+    func readOnlyProjection(text projectedText: String) -> UniversalTextSelection {
+        UniversalTextSelection(
+            app: app,
+            rawText: projectedText,
+            text: projectedText,
+            captureMethod: captureMethod,
+            anchorRect: anchorRect,
+            element: nil,
+            selectedRange: nil
+        )
+    }
+
+    func replace(
+        with replacement: String,
+        authorizationCheck: @MainActor () -> Bool = { true }
+    ) async throws {
         guard AccessibilityPermission.isTrusted else {
             throw UniversalSelectionError.accessibilityPermissionRequired
         }
+        guard authorizationCheck() else { throw CancellationError() }
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,
               !app.isTerminated else {
             throw UniversalSelectionError.sourceApplicationChanged
@@ -653,7 +672,8 @@ final class UniversalTextSelection {
             replacement: renderedReplacement
         )
 
-        if Self.isSettable(kAXSelectedTextAttribute, on: element),
+        if authorizationCheck(),
+           Self.isSettable(kAXSelectedTextAttribute, on: element),
            AXUIElementSetAttributeValue(
                element,
                kAXSelectedTextAttribute as CFString,
@@ -675,6 +695,7 @@ final class UniversalTextSelection {
         }
 
         if let expectedValue,
+           authorizationCheck(),
            Self.isSettable(kAXValueAttribute, on: element),
            AXUIElementSetAttributeValue(
                element,
@@ -853,7 +874,8 @@ final class UniversalTextSelection {
 @MainActor
 struct UniversalSelectionReader {
     func captureUsingCopyMenuOnly(
-        from app: NSRunningApplication?
+        from app: NSRunningApplication?,
+        authorizationCheck: @MainActor () -> Bool = { true }
     ) async throws -> UniversalTextSelection? {
         guard let app,
               !app.isTerminated,
@@ -863,11 +885,13 @@ struct UniversalSelectionReader {
         guard AccessibilityPermission.isTrusted else {
             throw UniversalSelectionError.accessibilityPermissionRequired
         }
+        guard authorizationCheck() else { throw CancellationError() }
         AccessibilityMessagingPolicy.configureIfNeeded()
         return try await clipboardSelection(
             in: app,
             allowKeyboardCopyFallback: false,
-            allowMenuFocusChangeAfterCopy: true
+            allowMenuFocusChangeAfterCopy: true,
+            authorizationCheck: authorizationCheck
         )
     }
 
@@ -876,7 +900,8 @@ struct UniversalSelectionReader {
         scanPolicy: SelectionScanPolicy,
         allowClipboardFallback: Bool,
         allowKeyboardCopyFallback: Bool = true,
-        hints: SelectionCaptureHints = SelectionCaptureHints()
+        hints: SelectionCaptureHints = SelectionCaptureHints(),
+        authorizationCheck: @MainActor () -> Bool = { true }
     ) async throws -> UniversalTextSelection? {
         guard let app,
               !app.isTerminated,
@@ -887,6 +912,7 @@ struct UniversalSelectionReader {
             SelectionDiagnostics.record("capture rejected: accessibility permission missing")
             throw UniversalSelectionError.accessibilityPermissionRequired
         }
+        guard authorizationCheck() else { throw CancellationError() }
         AccessibilityMessagingPolicy.configureIfNeeded()
 
         let retryDelays = [UInt64(0)]
@@ -896,11 +922,13 @@ struct UniversalSelectionReader {
                 try await Task.sleep(nanoseconds: delay)
             }
             try Task.checkCancellation()
+            guard authorizationCheck() else { throw CancellationError() }
             guard NSWorkspace.shared.frontmostApplication?.processIdentifier
                     == app.processIdentifier || app.isActive else {
                 SelectionDiagnostics.record("capture stopped: source app changed")
                 return nil
             }
+            guard authorizationCheck() else { throw CancellationError() }
             if let accessibilitySelection = accessibilitySelection(
                 in: app,
                 scanPolicy: scanPolicy,
@@ -922,6 +950,7 @@ struct UniversalSelectionReader {
             )
             return nil
         }
+        guard authorizationCheck() else { throw CancellationError() }
         if focusedPathContainsProtectedContent(in: app) {
             SelectionDiagnostics.record(
                 "capture rejected method=clipboard app=\(app.bundleIdentifier ?? "unknown") reason=protected"
@@ -931,7 +960,8 @@ struct UniversalSelectionReader {
         let clipboardResult = try await clipboardSelection(
             in: app,
             allowKeyboardCopyFallback: allowKeyboardCopyFallback,
-            allowMenuFocusChangeAfterCopy: false
+            allowMenuFocusChangeAfterCopy: false,
+            authorizationCheck: authorizationCheck
         )
         SelectionDiagnostics.record(
             "capture \(clipboardResult == nil ? "empty" : "success") method=clipboard app=\(app.bundleIdentifier ?? "unknown") count=\(clipboardResult?.text.count ?? 0)"
@@ -1230,8 +1260,10 @@ struct UniversalSelectionReader {
     private func clipboardSelection(
         in app: NSRunningApplication,
         allowKeyboardCopyFallback: Bool,
-        allowMenuFocusChangeAfterCopy: Bool
+        allowMenuFocusChangeAfterCopy: Bool,
+        authorizationCheck: @MainActor () -> Bool
     ) async throws -> UniversalTextSelection? {
+        guard authorizationCheck() else { throw CancellationError() }
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier
                 || app.isActive else {
             throw UniversalSelectionError.sourceApplicationChanged
@@ -1265,7 +1297,8 @@ struct UniversalSelectionReader {
         let snapshot = PasteboardSnapshot.capture()
         let baselineChangeCount = snapshot.changeCountAtCapture
         let menuCopyItem = enabledCopyMenuItem(in: app)
-        guard pasteboard.changeCount == baselineChangeCount,
+        guard authorizationCheck(),
+              pasteboard.changeCount == baselineChangeCount,
               selectionCopyContextIsCurrent(
                   injectionContext,
                   initialSelectedRange: initialSelectedRange,
@@ -1275,7 +1308,8 @@ struct UniversalSelectionReader {
               let captureMethod = triggerCopy(
                   menuItem: menuCopyItem,
                   processIdentifier: app.processIdentifier,
-                  allowKeyboardFallback: allowKeyboardCopyFallback
+                  allowKeyboardFallback: allowKeyboardCopyFallback,
+                  authorizationCheck: authorizationCheck
               ) else {
             return nil
         }
@@ -1286,6 +1320,7 @@ struct UniversalSelectionReader {
         for _ in 0..<24 {
             try Task.checkCancellation()
             try await Task.sleep(nanoseconds: 25_000_000)
+            guard authorizationCheck() else { throw CancellationError() }
             guard inputGuard.epoch == initialInputEpoch else {
                 // The current pasteboard may now be a deliberate user copy.
                 // Preserve it and discard the fallback result.
@@ -1316,6 +1351,7 @@ struct UniversalSelectionReader {
         // user copy or clipboard manager). Any extra change makes ownership
         // ambiguous, so the result is discarded and the clipboard is left as-is.
         try await Task.sleep(nanoseconds: 90_000_000)
+        guard authorizationCheck() else { throw CancellationError() }
         let appRemainsActive = NSWorkspace.shared.frontmostApplication?.processIdentifier
                 == app.processIdentifier || app.isActive
         let contextIsCurrent = selectionCopyContextIsCurrent(
@@ -1340,7 +1376,8 @@ struct UniversalSelectionReader {
             return nil
         }
 
-        guard ClipboardFallbackSafety.canRestore(
+        guard authorizationCheck(),
+              ClipboardFallbackSafety.canRestore(
             acceptedChangeCount: observedChangeCount,
             currentChangeCount: pasteboard.changeCount,
             initialInputEpoch: initialInputEpoch,
@@ -1355,6 +1392,7 @@ struct UniversalSelectionReader {
             return nil
         }
 
+        guard authorizationCheck() else { throw CancellationError() }
         snapshot.restoreIfChangeCount(is: observedChangeCount)
         guard let rawText = copiedValue,
               let text = SelectionTextNormalizer.normalizedText(from: rawText) else {
@@ -1375,16 +1413,20 @@ struct UniversalSelectionReader {
     private func triggerCopy(
         menuItem: AXUIElement?,
         processIdentifier: pid_t,
-        allowKeyboardFallback: Bool
+        allowKeyboardFallback: Bool,
+        authorizationCheck: @MainActor () -> Bool
     ) -> SelectionCaptureMethod? {
+        guard authorizationCheck() else { return nil }
         if let menuItem {
+            guard authorizationCheck() else { return nil }
             let result = AXUIElementPerformAction(menuItem, kAXPressAction as CFString)
             SelectionDiagnostics.record("copy trigger method=menu result=\(result.rawValue)")
             if result == .success {
                 return .menuCopyFallback
             }
         }
-        guard allowKeyboardFallback,
+        guard authorizationCheck(),
+              allowKeyboardFallback,
               postCopyCommand(to: processIdentifier) else {
             return nil
         }

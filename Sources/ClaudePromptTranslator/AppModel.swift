@@ -39,6 +39,12 @@ enum ResponseSelectionSnapshotPolicy {
     }
 }
 
+enum ResponseSelectionSnapshotCapturePolicy {
+    static func allows(_ captureMethod: SelectionCaptureMethod) -> Bool {
+        captureMethod == .accessibility
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     enum ShowReason {
@@ -92,6 +98,19 @@ final class AppModel: ObservableObject {
                 clipboardCompatibilityEnabled,
                 forKey: DefaultsKey.clipboardCompatibilityEnabled
             )
+        }
+    }
+    @Published private(set) var blockedApplicationBundleIdentifiers: Set<String> = [] {
+        didSet {
+            UserDefaults.standard.set(
+                blockedApplicationBundleIdentifiers.sorted(),
+                forKey: DefaultsKey.blockedApplicationBundleIdentifiers
+            )
+        }
+    }
+    @Published var contentFilterLevel: ContentFilterLevel = .bodyFirst {
+        didSet {
+            UserDefaults.standard.set(contentFilterLevel.rawValue, forKey: DefaultsKey.contentFilterLevel)
         }
     }
     @Published var selectionDetectionEnabled: Bool {
@@ -205,9 +224,14 @@ final class AppModel: ObservableObject {
     private let screenRegionOCRService = ScreenRegionOCRService()
     private let subtitleTranslationCache = SubtitleTranslationCache()
     private lazy var panelController = PromptPanelController(model: self)
-    private lazy var selectionMonitor = UniversalSelectionMonitor { [weak self] app, hints in
-        self?.inspectPassiveSelection(in: app, hints: hints)
-    }
+    private lazy var selectionMonitor = UniversalSelectionMonitor(
+        isApplicationAllowed: { [weak self] app in
+            self?.isCaptureAllowed(in: app) == true
+        },
+        handler: { [weak self] app, hints in
+            self?.inspectPassiveSelection(in: app, hints: hints)
+        }
+    )
     private lazy var hoverMonitor = HoverTranslationMonitor { [weak self] app, point in
         self?.inspectHoverText(in: app, at: point)
     }
@@ -216,6 +240,7 @@ final class AppModel: ObservableObject {
     private var detectedSelection: UniversalTextSelection?
     private var selectionCaptureTask: Task<Void, Never>?
     private var selectionTranslationTask: Task<Void, Never>?
+    private var selectionReplacementTask: Task<Void, Never>?
     private var hoverCaptureTask: Task<Void, Never>?
     private var screenOCRTask: Task<Void, Never>?
     private var subtitleTask: Task<Void, Never>?
@@ -227,6 +252,7 @@ final class AppModel: ObservableObject {
     private var responseSelectionExpiryTask: Task<Void, Never>?
     private var lastHoverFingerprint = ""
     private var lastHoverDate = Date.distantPast
+    private var selectionFilterNote = ""
 
     init() {
         let savedTarget = UserDefaults.standard.string(forKey: DefaultsKey.targetLanguage)
@@ -325,6 +351,14 @@ final class AppModel: ObservableObject {
             )
         }
 
+        self.blockedApplicationBundleIdentifiers = Set(
+            UserDefaults.standard.stringArray(
+                forKey: DefaultsKey.blockedApplicationBundleIdentifiers
+            )?.compactMap(AppPrivacyPolicy.normalizedIdentifier) ?? []
+        )
+        self.contentFilterLevel = UserDefaults.standard.string(forKey: DefaultsKey.contentFilterLevel)
+            .flatMap(ContentFilterLevel.init(rawValue:)) ?? .bodyFirst
+
         self.subtitleDisplayMode = UserDefaults.standard.string(forKey: DefaultsKey.subtitleDisplayMode)
             .flatMap(SubtitleDisplayMode.init(rawValue:)) ?? .bilingual
         self.subtitleOverlayStyle = UserDefaults.standard.string(forKey: DefaultsKey.subtitleOverlayStyle)
@@ -399,6 +433,18 @@ final class AppModel: ObservableObject {
             return
         }
 
+        if let target, !isCaptureAllowed(in: target.app) {
+            statusMessage = privacyBlockedMessage(for: target.app)
+            return
+        }
+        if target == nil,
+           let frontmost = NSWorkspace.shared.frontmostApplication,
+           !isHelperApp(frontmost),
+           !isCaptureAllowed(in: frontmost) {
+            statusMessage = privacyBlockedMessage(for: frontmost)
+            return
+        }
+
         if let target {
             rememberTarget(target)
         } else if let frontmost = NSWorkspace.shared.frontmostApplication, !isHelperApp(frontmost) {
@@ -429,6 +475,10 @@ final class AppModel: ObservableObject {
     }
 
     func showReplyTranslationPanel(for app: NSRunningApplication?) {
+        if let app, !isCaptureAllowed(in: app) {
+            statusMessage = privacyBlockedMessage(for: app)
+            return
+        }
         if let app, !isHelperApp(app) {
             rememberTarget(app)
         }
@@ -473,11 +523,11 @@ final class AppModel: ObservableObject {
 
     var responseScanApplication: NSRunningApplication? {
         if let frontmost = NSWorkspace.shared.frontmostApplication,
-           !isHelperApp(frontmost), detector.isAIContext(frontmost) {
+           isCaptureAllowed(in: frontmost), detector.isAIContext(frontmost) {
             return frontmost
         }
 
-        if let app = lastInputTarget?.app, !app.isTerminated {
+        if let app = lastInputTarget?.app, !app.isTerminated, isCaptureAllowed(in: app) {
             return app
         }
 
@@ -485,7 +535,7 @@ final class AppModel: ObservableObject {
     }
 
     func rememberTarget(_ app: NSRunningApplication) {
-        guard !isHelperApp(app), detector.isAIContext(app) else {
+        guard isCaptureAllowed(in: app), detector.isAIContext(app) else {
             return
         }
         if let target = InputTarget.captureTextTarget(from: app) {
@@ -494,7 +544,7 @@ final class AppModel: ObservableObject {
     }
 
     func rememberTarget(_ target: InputTarget) {
-        guard !isHelperApp(target.app) else {
+        guard isCaptureAllowed(in: target.app) else {
             return
         }
         if targetAppName != target.appName {
@@ -507,6 +557,94 @@ final class AppModel: ObservableObject {
     func isHelperApp(_ app: NSRunningApplication) -> Bool {
         app.bundleIdentifier == Bundle.main.bundleIdentifier
             || app.processIdentifier == ProcessInfo.processInfo.processIdentifier
+    }
+
+    func isCaptureAllowed(in app: NSRunningApplication) -> Bool {
+        !isHelperApp(app)
+            && AppPrivacyPolicy.allowsCapture(
+                bundleIdentifier: app.bundleIdentifier,
+                userBlockedIdentifiers: blockedApplicationBundleIdentifiers
+            )
+    }
+
+    @discardableResult
+    func blockApplicationForPrivacy(_ app: NSRunningApplication) -> Bool {
+        guard let identifier = AppPrivacyPolicy.normalizedIdentifier(app.bundleIdentifier),
+              !AppPrivacyPolicy.isBuiltInProtected(identifier) else {
+            statusMessage = "该应用已由内置敏感应用策略保护。"
+            return false
+        }
+        let blockedProcessIdentifier = app.processIdentifier
+        blockedApplicationBundleIdentifiers.insert(identifier)
+        selectionMonitor.refreshPrivacyPolicy()
+        inputTranslationGeneration &+= 1
+        inputTranslationTask?.cancel()
+        inputTranslationTask = nil
+        selectionCaptureTask?.cancel()
+        selectionTranslationTask?.cancel()
+        selectionReplacementTask?.cancel()
+        hoverCaptureTask?.cancel()
+        screenOCRTask?.cancel()
+        screenOCRTask = nil
+        screenRegionSelectionController.cancel()
+        if lastInputTarget?.app.processIdentifier == app.processIdentifier {
+            lastInputTarget = nil
+            targetAppName = ""
+        }
+        purgeSensitiveTranslationState(for: blockedProcessIdentifier)
+        stopSubtitleTranslation()
+        Task { await subtitleTranslationCache.removeAll() }
+        clearRecentResponseSelection(for: blockedProcessIdentifier)
+        unifiedBarController.refresh()
+        statusMessage = "已禁止在 \(app.localizedName ?? identifier) 中读取、OCR 或翻译内容。"
+        return true
+    }
+
+    private func purgeSensitiveTranslationState(for processIdentifier: pid_t) {
+        let selectionBelongsToBlockedApplication = detectedSelection?.app.processIdentifier
+            == processIdentifier
+        dismissSelectionOverlay()
+        if selectionBelongsToBlockedApplication || !selectionSourceText.isEmpty {
+            selectionSourceText = ""
+            selectionTranslationText = ""
+            selectionStatus = ""
+            selectionSourceLanguageName = "自动识别"
+            selectionTargetLanguageName = "简体中文"
+            selectionSourceAppName = "当前应用"
+            selectionCanReplace = false
+        }
+        subtitleSourceText = ""
+        subtitleTranslationText = ""
+        lastTranslation = ""
+        clearResponseTranslation()
+    }
+
+    @discardableResult
+    func allowApplicationForPrivacy(_ app: NSRunningApplication) -> Bool {
+        allowApplicationForPrivacy(bundleIdentifier: app.bundleIdentifier)
+    }
+
+    @discardableResult
+    func allowApplicationForPrivacy(bundleIdentifier: String?) -> Bool {
+        guard let identifier = AppPrivacyPolicy.normalizedIdentifier(bundleIdentifier),
+              !AppPrivacyPolicy.isBuiltInProtected(identifier) else {
+            return false
+        }
+        let removed = blockedApplicationBundleIdentifiers.remove(identifier) != nil
+        if removed {
+            statusMessage = "已允许在 \(identifier) 中使用翻译功能。"
+            selectionMonitor.refreshPrivacyPolicy()
+            unifiedBarController.refresh()
+        }
+        return removed
+    }
+
+    var userBlockedApplicationIdentifiers: [String] {
+        blockedApplicationBundleIdentifiers.sorted()
+    }
+
+    private func privacyBlockedMessage(for app: NSRunningApplication) -> String {
+        "隐私名单已禁止读取 \(app.localizedName ?? app.bundleIdentifier ?? "此应用")。"
     }
 
     func submitPrompt() {
@@ -523,6 +661,12 @@ final class AppModel: ObservableObject {
         isTranslating = true
         statusMessage = "正在翻译为\(targetLanguage.displayName)…"
         let deliveryTarget = lastInputTarget
+        guard deliveryTarget.map({ isCaptureAllowed(in: $0.app) }) ?? true else {
+            statusMessage = deliveryTarget.map { privacyBlockedMessage(for: $0.app) }
+                ?? "隐私名单已禁止读取此应用。"
+            isTranslating = false
+            return
+        }
 
         inputTranslationGeneration &+= 1
         let generation = inputTranslationGeneration
@@ -563,7 +707,10 @@ final class AppModel: ObservableObject {
                 try await deliveryService.deliver(
                     output.text,
                     to: deliveryTarget,
-                    allowClipboardFallback: clipboardCompatibilityEnabled
+                    allowClipboardFallback: clipboardCompatibilityEnabled,
+                    authorizationCheck: { [weak self] in
+                        self?.isCaptureAllowed(in: deliveryTarget.app) == true
+                    }
                 )
                 try Task.checkCancellation()
                 guard TranslationOperationSafety.canContinue(
@@ -609,11 +756,15 @@ final class AppModel: ObservableObject {
         selectionMonitor.stop()
         hoverMonitor.stop()
         selectionCaptureTask?.cancel()
+        selectionTranslationTask?.cancel()
+        selectionReplacementTask?.cancel()
         hoverCaptureTask?.cancel()
         screenOCRTask?.cancel()
         subtitleTask?.cancel()
         screenRegionSelectionController.cancel()
         selectionCaptureTask = nil
+        selectionTranslationTask = nil
+        selectionReplacementTask = nil
         hoverCaptureTask = nil
         screenOCRTask = nil
         subtitleTask = nil
@@ -622,6 +773,7 @@ final class AppModel: ObservableObject {
         responseSelectionExpiryTask = nil
         recentResponseSelectionSnapshot = nil
         subtitleOverlayController.hide()
+        Task { await subtitleTranslationCache.removeAll() }
     }
 
     func translateScreenRegion() {
@@ -638,9 +790,14 @@ final class AppModel: ObservableObject {
             showSelectionFailure("请先切换到包含图片、Canvas 或字幕的应用。")
             return
         }
+        guard isCaptureAllowed(in: sourceApp) else {
+            showSelectionFailure(privacyBlockedMessage(for: sourceApp))
+            return
+        }
 
         screenOCRTask?.cancel()
         selectionTranslationTask?.cancel()
+        selectionReplacementTask?.cancel()
         selectionGeneration += 1
         let generation = selectionGeneration
         let suggestedRegion = ScreenRegionSelection.frontmostWindow(of: sourceApp)
@@ -652,6 +809,10 @@ final class AppModel: ObservableObject {
                   !Task.isCancelled else {
                 return
             }
+            guard isCaptureAllowed(in: sourceApp) else {
+                showSelectionFailure(privacyBlockedMessage(for: sourceApp))
+                return
+            }
             selectionPhase = .reading
             selectionSourceText = ""
             selectionTranslationText = ""
@@ -661,8 +822,19 @@ final class AppModel: ObservableObject {
             selectionOverlayController.show(anchorRect: region.appKitRect)
             do {
                 try await Task.sleep(nanoseconds: 140_000_000)
-                let result = try await screenRegionOCRService.recognize(region: region)
-                guard !Task.isCancelled, selectionGeneration == generation else { return }
+                guard isCaptureAllowed(in: sourceApp) else {
+                    throw CancellationError()
+                }
+                let result = try await screenRegionOCRService.recognize(
+                    region: region,
+                    sourceApplication: sourceApp,
+                    authorizationCheck: { [weak self] in
+                        self?.isCaptureAllowed(in: sourceApp) == true
+                    }
+                )
+                guard !Task.isCancelled,
+                      selectionGeneration == generation,
+                      isCaptureAllowed(in: sourceApp) else { return }
                 let selection = UniversalTextSelection(
                     app: sourceApp,
                     rawText: result.text,
@@ -673,7 +845,7 @@ final class AppModel: ObservableObject {
                     selectedRange: nil
                 )
                 present(selection)
-                selectionStatus = "本机 OCR 识别 (result.lineCount) 行 · 未保存截图"
+                selectionStatus = "本机 OCR 识别 \(result.lineCount) 行 · 未保存截图"
                 selectionOverlayController.refresh()
                 beginTranslation(for: selection)
             } catch is CancellationError {
@@ -699,6 +871,10 @@ final class AppModel: ObservableObject {
             statusMessage = "请先切换到正在播放视频的应用。"
             return
         }
+        guard isCaptureAllowed(in: sourceApp) else {
+            statusMessage = privacyBlockedMessage(for: sourceApp)
+            return
+        }
 
         stopSubtitleTranslation()
         subtitleStatus = "请框选视频中的字幕区域"
@@ -712,6 +888,10 @@ final class AppModel: ObservableObject {
                 subtitleStatus = "已取消"
                 return
             }
+            guard isCaptureAllowed(in: sourceApp) else {
+                subtitleStatus = privacyBlockedMessage(for: sourceApp)
+                return
+            }
 
             sourceApp.activate()
             subtitleTranslationActive = true
@@ -721,10 +901,19 @@ final class AppModel: ObservableObject {
             subtitleOverlayController.show(region: region)
 
             var cueProcessor = SubtitleCueProcessor()
-            while !Task.isCancelled, subtitleTranslationActive {
+            while !Task.isCancelled,
+                  subtitleTranslationActive,
+                  isCaptureAllowed(in: sourceApp) {
                 do {
-                    let result = try await screenRegionOCRService.recognize(region: region)
-                    guard !Task.isCancelled else { break }
+                    guard isCaptureAllowed(in: sourceApp) else { break }
+                    let result = try await screenRegionOCRService.recognize(
+                        region: region,
+                        sourceApplication: sourceApp,
+                        authorizationCheck: { [weak self] in
+                            self?.isCaptureAllowed(in: sourceApp) == true
+                        }
+                    )
+                    guard !Task.isCancelled, isCaptureAllowed(in: sourceApp) else { break }
                     if let cue = cueProcessor.observe(result.text) {
                         subtitleSourceText = cue
                         let route = languageRoute(for: cue)
@@ -746,7 +935,9 @@ final class AppModel: ObservableObject {
                                 target: route.targetLanguage
                             )
                         }
-                        guard !Task.isCancelled, subtitleTranslationActive else { break }
+                        guard !Task.isCancelled,
+                              subtitleTranslationActive,
+                              isCaptureAllowed(in: sourceApp) else { break }
                         subtitleTranslationText = output.text
                         subtitleStatus = "\(output.providerName) · 区域 OCR"
                         subtitleOverlayController.refresh()
@@ -771,6 +962,9 @@ final class AppModel: ObservableObject {
         subtitleTranslationActive = false
         screenRegionSelectionController.cancel()
         subtitleOverlayController.hide()
+        subtitleSourceText = ""
+        subtitleTranslationText = ""
+        Task { await subtitleTranslationCache.removeAll() }
         if subtitleStatus != "未启动" {
             subtitleStatus = "已停止"
         }
@@ -789,6 +983,10 @@ final class AppModel: ObservableObject {
         guard let sourceApp = NSWorkspace.shared.frontmostApplication,
               !isHelperApp(sourceApp) else {
             showSelectionFailure("请先在浏览器或其他 App 中选中文字。")
+            return
+        }
+        guard isCaptureAllowed(in: sourceApp) else {
+            showSelectionFailure(privacyBlockedMessage(for: sourceApp))
             return
         }
 
@@ -811,7 +1009,10 @@ final class AppModel: ObservableObject {
                 let selection = try await selectionReader.capture(
                     from: sourceApp,
                     scanPolicy: .boundedTree,
-                    allowClipboardFallback: clipboardCompatibilityEnabled
+                    allowClipboardFallback: clipboardCompatibilityEnabled,
+                    authorizationCheck: { [weak self] in
+                        self?.isCaptureAllowed(in: sourceApp) == true
+                    }
                 )
                 guard !Task.isCancelled, selectionGeneration == generation else {
                     return
@@ -846,7 +1047,10 @@ final class AppModel: ObservableObject {
                 let selection = try await selectionReader.capture(
                     from: app,
                     scanPolicy: .boundedTree,
-                    allowClipboardFallback: false
+                    allowClipboardFallback: false,
+                    authorizationCheck: { [weak self] in
+                        self?.isCaptureAllowed(in: app) == true
+                    }
                 )
                 guard let selection else {
                     SelectionDiagnostics.record("debug probe found no selection")
@@ -888,12 +1092,25 @@ final class AppModel: ObservableObject {
               !selectionTranslationText.isEmpty else {
             return
         }
+        guard isCaptureAllowed(in: selection.app) else {
+            selectionStatus = privacyBlockedMessage(for: selection.app)
+            selectionCanReplace = false
+            selectionOverlayController.refresh()
+            return
+        }
         let replacement = selectionTranslationText
+        let generation = selectionGeneration
         selectionStatus = "正在安全替换原选区…"
         selectionOverlayController.refresh()
 
-        Task { [weak self] in
+        selectionReplacementTask?.cancel()
+        selectionReplacementTask = Task { [weak self] in
             guard let self else { return }
+            defer {
+                if selectionGeneration == generation {
+                    selectionReplacementTask = nil
+                }
+            }
             do {
 #if DEBUG
                 // Computer Use must temporarily activate the debug overlay to
@@ -905,10 +1122,31 @@ final class AppModel: ObservableObject {
                     try await Task.sleep(nanoseconds: 100_000_000)
                 }
 #endif
-                try await selection.replace(with: replacement)
+                guard isCaptureAllowed(in: selection.app),
+                      selectionGeneration == generation else {
+                    throw CancellationError()
+                }
+                try await selection.replace(
+                    with: replacement,
+                    authorizationCheck: { [weak self] in
+                        guard let self else { return false }
+                        return selectionGeneration == generation
+                            && isCaptureAllowed(in: selection.app)
+                    }
+                )
+                guard isCaptureAllowed(in: selection.app),
+                      selectionGeneration == generation else {
+                    throw CancellationError()
+                }
                 selectionStatus = "已在 \(selection.appName) 中替换选区。"
                 selectionCanReplace = false
                 selectionOverlayController.refresh()
+            } catch is CancellationError {
+                if selectionGeneration == generation {
+                    selectionStatus = privacyBlockedMessage(for: selection.app)
+                    selectionCanReplace = false
+                    selectionOverlayController.refresh()
+                }
             } catch {
                 selectionStatus = error.localizedDescription
                 selectionPhase = .failed
@@ -920,9 +1158,11 @@ final class AppModel: ObservableObject {
     func dismissSelectionOverlay() {
         selectionCaptureTask?.cancel()
         selectionTranslationTask?.cancel()
+        selectionReplacementTask?.cancel()
         hoverCaptureTask?.cancel()
         selectionCaptureTask = nil
         selectionTranslationTask = nil
+        selectionReplacementTask = nil
         hoverCaptureTask = nil
         selectionGeneration += 1
         detectedSelection = nil
@@ -950,7 +1190,7 @@ final class AppModel: ObservableObject {
         guard translatorEnabled,
               selectionDetectionEnabled,
               AccessibilityPermission.isTrusted,
-              !isHelperApp(app) else {
+              isCaptureAllowed(in: app) else {
             SelectionDiagnostics.record("passive inspection skipped")
             return
         }
@@ -967,21 +1207,32 @@ final class AppModel: ObservableObject {
                     from: app,
                     scanPolicy: .focusedPath,
                     allowClipboardFallback: false,
-                    hints: hints
+                    hints: hints,
+                    authorizationCheck: { [weak self] in
+                        self?.isCaptureAllowed(in: app) == true
+                    }
                 )
                 guard !Task.isCancelled else { return }
-                guard let selection = capturedSelection else {
+                guard let capturedSelection else {
                     clearRecentResponseSelection(for: app.processIdentifier)
                     SelectionDiagnostics.record("passive inspection found no selection")
                     return
                 }
                 guard PassiveTextEligibility.normalizedCandidate(
-                    selection.text,
+                    capturedSelection.text,
                     maximumCharacters: TranslationLimits.maxInputCharacters
                 ) != nil else {
                     SelectionDiagnostics.record("passive selection skipped by quick filter")
                     return
                 }
+                guard let filtered = contentFilteredSelection(
+                    capturedSelection,
+                    intent: .passiveSelection
+                ) else {
+                    SelectionDiagnostics.record("passive selection skipped by content filter")
+                    return
+                }
+                let selection = filtered.selection
                 if selection.fingerprint == lastPassiveSelectionFingerprint,
                    selectionOverlayController.isVisible {
                     return
@@ -992,6 +1243,7 @@ final class AppModel: ObservableObject {
                 )
                 selectionTranslationTask?.cancel()
                 present(selection)
+                selectionFilterNote = filtered.note
                 if automaticSelectionTranslationEnabled {
                     beginTranslation(for: selection)
                 }
@@ -1006,17 +1258,21 @@ final class AppModel: ObservableObject {
         guard translatorEnabled,
               hoverTranslationEnabled,
               AccessibilityPermission.isTrusted,
-              !isHelperApp(app) else {
+              isCaptureAllowed(in: app) else {
             return
         }
 
         hoverCaptureTask?.cancel()
         hoverCaptureTask = Task { [weak self] in
             guard let self,
-                  let selection = hoverReader.capture(from: app, at: point),
+                  let capturedSelection = hoverReader.capture(from: app, at: point),
                   !Task.isCancelled else {
                 return
             }
+            guard let filtered = contentFilteredSelection(capturedSelection, intent: .hover) else {
+                return
+            }
+            let selection = filtered.selection
             let now = Date()
             if selection.fingerprint == lastHoverFingerprint,
                now.timeIntervalSince(lastHoverDate) < 4 {
@@ -1026,11 +1282,13 @@ final class AppModel: ObservableObject {
             lastHoverDate = now
             selectionTranslationTask?.cancel()
             present(selection)
+            selectionFilterNote = filtered.note
             beginTranslation(for: selection)
         }
     }
 
     private func present(_ selection: UniversalTextSelection) {
+        selectionFilterNote = ""
         detectedSelection = selection
         updateRecentResponseSelection(from: selection)
         let route = languageRoute(for: selection.text)
@@ -1076,36 +1334,9 @@ final class AppModel: ObservableObject {
         return snapshot
     }
 
-    func captureExplicitResponseSelection(
-        from app: NSRunningApplication
-    ) async -> DetectedForeignResponse? {
-        do {
-            guard let selection = try await selectionReader.captureUsingCopyMenuOnly(from: app),
-                  let response = AIResponseReader.foreignSelection(from: selection.text) else {
-                return nil
-            }
-            let applicationIdentifier = app.bundleIdentifier
-                ?? app.localizedName
-                ?? "pid-\(app.processIdentifier)"
-            return response.annotated(
-                source: .selectedText,
-                applicationIdentifier: applicationIdentifier
-            )
-        } catch {
-            SelectionDiagnostics.record(
-                "explicit response selection unavailable error=\(String(describing: error))"
-            )
-            return nil
-        }
-    }
-
     private func updateRecentResponseSelection(from selection: UniversalTextSelection) {
-        let eligibleCaptureMethods: Set<SelectionCaptureMethod> = [
-            .accessibility,
-            .menuCopyFallback,
-            .clipboardFallback
-        ]
-        guard eligibleCaptureMethods.contains(selection.captureMethod),
+        guard ResponseSelectionSnapshotCapturePolicy.allows(selection.captureMethod),
+              isCaptureAllowed(in: selection.app),
               detector.isAIContext(selection.app) else {
             return
         }
@@ -1163,7 +1394,7 @@ final class AppModel: ObservableObject {
         selectionTranslationText = ""
         selectionSourceLanguageName = route.sourceDisplayName
         selectionTargetLanguageName = route.targetLanguage.displayName
-        selectionStatus = "正在翻译为\(route.targetLanguage.displayName)…"
+        selectionStatus = "正在翻译为\(route.targetLanguage.displayName)…\(selectionFilterNote)"
         SelectionDiagnostics.record(
             "translation started target=\(route.targetLanguage.rawValue) count=\(selection.text.count)"
         )
@@ -1183,7 +1414,7 @@ final class AppModel: ObservableObject {
                 }
                 selectionTranslationText = output.text
                 lastTranslation = output.text
-                selectionStatus = "\(output.providerName) · \(route.sourceDisplayName) → \(route.targetLanguage.displayName)"
+                selectionStatus = "\(output.providerName) · \(route.sourceDisplayName) → \(route.targetLanguage.displayName)\(selectionFilterNote)"
                 selectionPhase = .translated
                 selectionCanReplace = selection.canReplace
                 SelectionDiagnostics.record("translation succeeded provider=\(output.providerName)")
@@ -1206,6 +1437,36 @@ final class AppModel: ObservableObject {
             for: text,
             manualTarget: automaticLanguageRoutingEnabled ? nil : targetLanguage
         )
+    }
+
+    private func contentFilteredSelection(
+        _ selection: UniversalTextSelection,
+        intent: ContentFilterIntent
+    ) -> (selection: UniversalTextSelection, note: String)? {
+        // Never filter an editable selection: replacing a translated subset
+        // could otherwise overwrite more text than the user intended.
+        if selection.canReplace {
+            return (selection, "")
+        }
+        guard let result = TranslationContentFilter.filter(
+            selection.text,
+            level: contentFilterLevel,
+            intent: intent,
+            appName: selection.appName,
+            windowTitle: AppWindowContext.title(for: selection.app)
+        ) else {
+            return nil
+        }
+        let projected = result.text == selection.text
+            ? selection
+            : selection.readOnlyProjection(text: result.text)
+        let note = result.removedLineCount > 0
+            ? " · \(result.profileIdentifier) 已跳过 \(result.removedLineCount) 行界面信息"
+            : ""
+        SelectionDiagnostics.record(
+            "content filter profile=\(result.profileIdentifier) removed=\(result.removedLineCount)"
+        )
+        return (projected, note)
     }
 
     private func showSelectionFailure(_ message: String) {
@@ -1239,6 +1500,10 @@ final class AppModel: ObservableObject {
             statusMessage = "请先点进 Claude 或 ChatGPT 的消息输入框，再点击“翻译输入”。"
             return
         }
+        guard isCaptureAllowed(in: target.app) else {
+            statusMessage = privacyBlockedMessage(for: target.app)
+            return
+        }
 
         rememberTarget(target)
         isTranslating = true
@@ -1256,9 +1521,15 @@ final class AppModel: ObservableObject {
                 }
             }
             do {
+                guard isCaptureAllowed(in: target.app) else {
+                    throw CancellationError()
+                }
                 guard let source = await deliveryService.readCurrentInput(
                     from: target,
-                    allowClipboardFallback: clipboardCompatibilityEnabled
+                    allowClipboardFallback: clipboardCompatibilityEnabled,
+                    authorizationCheck: { [weak self] in
+                        self?.isCaptureAllowed(in: target.app) == true
+                    }
                 ) else {
                     throw DeliveryError.emptyInput
                 }
@@ -1282,7 +1553,7 @@ final class AppModel: ObservableObject {
                     expectedGeneration: generation,
                     currentGeneration: inputTranslationGeneration,
                     translatorEnabled: translatorEnabled
-                ) else {
+                ), isCaptureAllowed(in: target.app) else {
                     throw CancellationError()
                 }
                 lastTranslation = output.text
@@ -1293,14 +1564,17 @@ final class AppModel: ObservableObject {
                     with: output.text,
                     in: target,
                     scope: source.replacementScope,
-                    allowClipboardFallback: clipboardCompatibilityEnabled
+                    allowClipboardFallback: clipboardCompatibilityEnabled,
+                    authorizationCheck: { [weak self] in
+                        self?.isCaptureAllowed(in: target.app) == true
+                    }
                 )
                 try Task.checkCancellation()
                 guard TranslationOperationSafety.canContinue(
                     expectedGeneration: generation,
                     currentGeneration: inputTranslationGeneration,
                     translatorEnabled: translatorEnabled
-                ) else {
+                ), isCaptureAllowed(in: target.app) else {
                     throw CancellationError()
                 }
                 statusMessage = source.usesSelection
@@ -1393,7 +1667,7 @@ final class AppModel: ObservableObject {
 
     private func currentInputTarget() -> InputTarget? {
         if let frontmost = NSWorkspace.shared.frontmostApplication,
-           !isHelperApp(frontmost), detector.isAIContext(frontmost) {
+           isCaptureAllowed(in: frontmost), detector.isAIContext(frontmost) {
             if let target = InputTarget.captureTextTarget(from: frontmost) {
                 return target
             }
@@ -1403,6 +1677,7 @@ final class AppModel: ObservableObject {
         // Only fall back to lastInputTarget when the last target was an AI app
         if let lastInputTarget, !lastInputTarget.app.isTerminated,
            lastInputTarget.hasConcreteTextInput,
+           isCaptureAllowed(in: lastInputTarget.app),
            detector.isAIContext(lastInputTarget.app) {
             return lastInputTarget
         }
@@ -1433,4 +1708,6 @@ private enum DefaultsKey {
     static let appTheme = "appTheme"
     static let inlineModeMigration = "inlineModeMigration"
     static let inlineInputPillMigration = "inlineInputPillMigration"
+    static let blockedApplicationBundleIdentifiers = "blockedApplicationBundleIdentifiers"
+    static let contentFilterLevel = "contentFilterLevel"
 }

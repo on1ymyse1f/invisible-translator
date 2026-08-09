@@ -80,6 +80,7 @@ enum ScreenTextOCRError: LocalizedError {
     case screenRecordingPermissionRequired
     case displayUnavailable
     case selectionTooSmall
+    case selectionOutsideSourceApplication
     case noTextRecognized
 
     var errorDescription: String? {
@@ -90,8 +91,29 @@ enum ScreenTextOCRError: LocalizedError {
             return "无法读取所选显示器，请重新框选。"
         case .selectionTooSmall:
             return "框选区域太小，请至少覆盖一行完整文字。"
+        case .selectionOutsideSourceApplication:
+            return "框选区域未覆盖启动 OCR 的来源 App 窗口；为保护其他 App，已拒绝截取。"
         case .noTextRecognized:
             return "所选区域没有识别到可翻译文字。"
+        }
+    }
+}
+
+enum ScreenRegionSourceWindowPolicy {
+    static func intersectsSourceWindow(
+        sourceRect: CGRect,
+        displayFrame: CGRect,
+        sourceWindowFrames: [CGRect]
+    ) -> Bool {
+        let selectedGlobalRect = CGRect(
+            x: displayFrame.minX + sourceRect.minX,
+            y: displayFrame.minY + sourceRect.minY,
+            width: sourceRect.width,
+            height: sourceRect.height
+        )
+        return sourceWindowFrames.contains { windowFrame in
+            let overlap = selectedGlobalRect.intersection(windowFrame)
+            return !overlap.isNull && overlap.width >= 4 && overlap.height >= 4
         }
     }
 }
@@ -212,18 +234,43 @@ private struct SendableCGImage: @unchecked Sendable {
 
 @MainActor
 struct ScreenRegionOCRService {
-    func recognize(region: ScreenRegionSelection) async throws -> ScreenTextOCRResult {
-        let image = try await capture(region: region)
+    func recognize(
+        region: ScreenRegionSelection,
+        sourceApplication: NSRunningApplication,
+        authorizationCheck: @MainActor () -> Bool
+    ) async throws -> ScreenTextOCRResult {
+        guard authorizationCheck() else { throw CancellationError() }
+        let image = try await capture(
+            region: region,
+            sourceApplication: sourceApplication,
+            authorizationCheck: authorizationCheck
+        )
+        try Task.checkCancellation()
+        guard authorizationCheck() else { throw CancellationError() }
         let sendableImage = SendableCGImage(value: image)
-        return try await Task.detached(priority: .userInitiated) {
-            try ScreenTextOCRRecognizer.recognize(in: sendableImage.value)
-        }.value
+        let recognitionTask = Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            return try ScreenTextOCRRecognizer.recognize(in: sendableImage.value)
+        }
+        return try await withTaskCancellationHandler {
+            let result = try await recognitionTask.value
+            try Task.checkCancellation()
+            guard authorizationCheck() else { throw CancellationError() }
+            return result
+        } onCancel: {
+            recognitionTask.cancel()
+        }
     }
 
-    private func capture(region: ScreenRegionSelection) async throws -> CGImage {
+    private func capture(
+        region: ScreenRegionSelection,
+        sourceApplication: NSRunningApplication,
+        authorizationCheck: @MainActor () -> Bool
+    ) async throws -> CGImage {
         guard ScreenRecordingPermission.isGranted else {
             throw ScreenTextOCRError.screenRecordingPermissionRequired
         }
+        guard authorizationCheck() else { throw CancellationError() }
         guard region.sourceRect.width >= 12, region.sourceRect.height >= 12 else {
             throw ScreenTextOCRError.selectionTooSmall
         }
@@ -236,14 +283,6 @@ struct ScreenRegionOCRService {
             throw ScreenTextOCRError.displayUnavailable
         }
 
-        let ownApplication = content.applications.filter {
-            $0.processID == ProcessInfo.processInfo.processIdentifier
-        }
-        let filter = SCContentFilter(
-            display: display,
-            excludingApplications: ownApplication,
-            exceptingWindows: []
-        )
         let configuration = SCStreamConfiguration()
         let sourceRect = region.sourceRect.intersection(
             CGRect(origin: .zero, size: region.screenFrame.size)
@@ -251,16 +290,36 @@ struct ScreenRegionOCRService {
         guard sourceRect.width >= 12, sourceRect.height >= 12 else {
             throw ScreenTextOCRError.selectionTooSmall
         }
+        let sourceWindows = content.windows.filter { window in
+            window.owningApplication?.processID == sourceApplication.processIdentifier
+                && ScreenRegionSourceWindowPolicy.intersectsSourceWindow(
+                    sourceRect: sourceRect,
+                    displayFrame: display.frame,
+                    sourceWindowFrames: [window.frame]
+                )
+        }
+        guard !sourceWindows.isEmpty else {
+            throw ScreenTextOCRError.selectionOutsideSourceApplication
+        }
+        // Include only windows owned by the App that was foreground when OCR
+        // started. Pixels from password managers or any other overlapping App
+        // are excluded even if the user drags the rectangle across them.
+        let filter = SCContentFilter(display: display, including: sourceWindows)
         configuration.sourceRect = sourceRect
         let scale = max(CGFloat(filter.pointPixelScale), 1)
         configuration.width = max(Int(sourceRect.width * scale), 1)
         configuration.height = max(Int(sourceRect.height * scale), 1)
         configuration.showsCursor = false
 
-        return try await SCScreenshotManager.captureImage(
+        try Task.checkCancellation()
+        guard authorizationCheck() else { throw CancellationError() }
+        let image = try await SCScreenshotManager.captureImage(
             contentFilter: filter,
             configuration: configuration
         )
+        try Task.checkCancellation()
+        guard authorizationCheck() else { throw CancellationError() }
+        return image
     }
 }
 

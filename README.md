@@ -45,12 +45,14 @@ Accessibility 快速读取（不碰剪贴板）
 - 选区浮层支持“原文 + 译文”或“仅显示译文”；12,000 字符以内的 Markdown 链接与基础强调会按富文本显示，超长内容自动退回纯文本以避免主线程解析卡顿。
 - 浮层优先贴近真实选区；应用不提供选区坐标时，退回到当前鼠标附近，但程序只读取鼠标位置，从不控制或移动鼠标。
 - 可选“鼠标悬停翻译”：指针稳定停留约 0.65 秒后，读取指针下方由 Accessibility 暴露的静态文本并自动翻译；输入框、搜索框、密码框和受保护内容均被排除，移动鼠标会取消尚未触发的读取。
+- 默认启用“正文优先”内容筛选：在高置信度 X/Twitter 窗口中，被动选区与悬停会跳过导航、按钮、账号 handle、时间、互动计数、广告标签和独立 URL；显式选区与用户框选 OCR 永远保留用户选择，不会被站点规则擅自删减。无法确认站点时保持 fail-open，不猜测网页身份。
+- 菜单栏提供“App 隐私名单”：1Password、钥匙串/密码、Bitwarden、Dashlane、LastPass、KeePassXC 等敏感 App 内置禁止读取；用户也可把当前 App 加入名单。加入后会取消正在进行的输入、选区、悬停、OCR、字幕与回复任务，并清除对应可见内容和内存缓存。
 - “框选屏幕文字（OCR）”用于 Canvas、图片和不暴露文字的 App：用户拖出明确区域后，ScreenCaptureKit 只截取该区域，Vision 在本机识别，截图不落盘，识别完成后进入同一个翻译浮层。
 - “视频字幕翻译”重复识别用户固定框选的字幕区域，不扫描整屏；字幕连续两帧稳定后才翻译，重复内容命中有界内存缓存。支持双语/仅译文、深色/浅色/高对比和三档字号。
 - OCR 字幕使用本地基础合并与断句：去除重复行，拉丁文字按词间空格合并，中日韩文字按字幕行连续合并。当前没有把字幕发送给外部 AI 做断句。
 - 长文本上限为输入 160,000 字符、AI 回复 96,000 字符、显式 OCR 60,000 字符；结构化分段上限为 3,000 字符。这里按 Swift Unicode 字符计数，并非 UTF-8 字节数。
 - 只读网页、PDF 和普通文本可复制译文；只有 Accessibility 能验证选区仍未变化、目标确实可写时，才显示“替换选区”。
-- 保留 AI 兼容边缘栏：聊天输入翻译只替换草稿且不会发送；回复按“当前选区 → 同一 App/PID 的 15 秒选区快照 → Accessibility 最新回复”读取。点击非激活边缘栏不会覆盖来源鼠标松开事件，快照到期会主动从内存清除。第一次“译回复”失败只显示“使用 OCR 重试”，只有用户第二次明确点击才可能请求屏幕录制；自动回复扫描永远不会截屏。
+- 保留 AI 兼容边缘栏：聊天输入翻译只替换草稿且不会发送；回复按“当前 Accessibility 选区 → 同一 App/PID 的 15 秒 Accessibility 选区快照 → Accessibility 最新回复”读取，剪贴板来源不能进入回复快照。点击非激活边缘栏不会覆盖来源鼠标松开事件，快照到期会主动从内存清除。第一次“译回复”失败只显示“使用 OCR 重试”；只有用户第二次明确点击才可能请求屏幕录制，此时 ScreenCaptureKit 只包含目标窗口并在捕获阶段限制为按布局近似计算的对话区域，而不是先截整窗再裁剪。该区域可能包含同列可见历史对话，因此仍优先推荐明确选中回复。自动回复扫描永远不会截屏，回复链无论兼容开关如何都不会读取、写入或快照剪贴板。
 - 旧备用输入窗已明确降级为高级草稿入口：文案不再声称会发送，`⌃⌥T` 只属于通用选区翻译。由于该入口需要把新文本插入另一个 App 的光标位置，目标不支持纯 AX 写入时仍需用户主动开启剪贴板兼容模式。
 
 ## 为什么不会再出现“点击翻译后鼠标被操控”
@@ -126,6 +128,8 @@ Accessibility 快速读取（不碰剪贴板）
 | [Susurro](https://github.com/benatespina/susurro) | MIT | 选中文字后显示轻量工具条 |
 | [ForceClickAI](https://github.com/NeoXue-ai/ForceClickAI) | MIT | 在系统 Lookup 改变选区前预取、浮层不中断来源 App；未采用私有 MultitouchSupport |
 | [mac-ocr](https://github.com/privatenumber/mac-ocr) / [TextGrabber2](https://github.com/TextGrabber2-app/TextGrabber2) | MIT | Vision OCR 的区域、置信度、取消与 Shortcuts/Services 思路；未捆绑额外 CLI |
+| [X-Feed-Filter](https://github.com/Saganaki22/X-Feed-Filter) | MIT | 参考字段分离、文本归一化、fail-open、缓存与防抖原则；原生端独立实现 AX/窗口上下文筛选，未复制浏览器扩展代码 |
+| [Readability](https://github.com/mozilla/readability) | Apache-2.0 | 参考正文相关性与保守回退原则；不引入 DOM 依赖，不把文章规则误用于单条社交帖子 |
 | [Easydict](https://github.com/tisfeng/Easydict) | GPL-3.0 | 只参考产品交互：划词图标、快捷键、OCR、多翻译服务 |
 | [Pot](https://github.com/pot-app/pot-desktop) | GPL-3.0 | 只参考产品分层：划词、输入、剪贴板、截图 OCR |
 | [CopyTranslator](https://github.com/CopyTranslator/CopyTranslator) | GPL-2.0 | 只参考“复制触发”和 PDF 文本清理场景 |
@@ -145,6 +149,9 @@ GPL/AGPL 项目只用于理解产品与架构模式，没有复制其源码。KI
 - “选中即自动翻译”默认关闭，并要求一次明确确认。
 - “鼠标悬停翻译”默认关闭；启用后只读取单个静态 AX 节点，不读取可编辑输入或密码内容。
 - “剪贴板兼容模式”默认关闭。关闭时，通用选区和 AI 输入读取/替换在 Accessibility 失败后直接停止，不会读取、写入或快照系统剪贴板。
+- AI 回复翻译与回复短期选区快照只接受 Accessibility 来源；即使用户另行开启剪贴板兼容，回复按钮和自动回复也绝不继承该路径。
+- App 隐私名单在每次捕获、OCR 与翻译交付前重查；加入名单会取消正在运行的区域选择、OCR、字幕和翻译任务，并清除可见原文/译文、回复缓存、字幕缓存与短期选区快照。
+- 浏览器自动 AI 兼容模式不再依据可伪造的窗口标题关键词；仅当 Accessibility 的 `AXWebArea/AXURL` 暴露 ChatGPT、Claude、Gemini 等精确允许域名时才启动输入/回复扫描。URL 不可得或只是普通网页标题提到 AI 时 fail-closed；显式通用选区仍可正常使用。
 - 开启剪贴板兼容模式前会警告：复制中的选区文字可能被第三方剪贴板管理器或 macOS 通用剪贴板观察；它只适合用户接受该风险、且目标 App 不提供 Accessibility 文本时临时使用。
 - 密码框、带 secure/password 角色或 `AXContainsProtectedContent` 的 Accessibility 元素会被排除；剪贴板 fallback 会检查焦点元素及最多 12 层祖先。
 - 剪贴板 fallback 只在用户明确开启兼容模式后使用；不预写 sentinel。它优先通过 AX 执行精确匹配、无额外修饰键且已启用的“复制”菜单，找不到时才发送定向 `Command+C`。它要求一次稳定 change count，并在约 90ms 静默期持续校验原 PID、焦点、选区范围与真实输入代次；任何第二次写入或用户输入都会放弃结果且不恢复，从而保留当前剪贴板。
@@ -154,10 +161,10 @@ GPL/AGPL 项目只用于理解产品与架构模式，没有复制其源码。KI
 - macOS 26 及以上、语言包已安装时使用无界面的本地会话，日常翻译不会重复打断当前 App。
 - 冷启动时系统偶尔会先报告语言包已安装、稍后才让本地会话就绪；应用先在 500ms 内做两次有界就绪检查，仍未就绪时回到 Apple 官方 `translationTask` 本地准备流程，不会切换到网络翻译。
 - 正式应用为仅本地翻译模式：Apple 不支持的语言组合会直接提示失败，不会降级到第三方网络服务。
-- AI 回复短期缓存只保存在内存中，使用 SHA-256 键、32 项上限和 5 分钟 TTL；重置、关闭或切换时清空。通用浮层的紧凑状态不显示选区原文。
+- AI 回复短期缓存只保存在内存中，使用 SHA-256 键、32 项上限和 5 分钟 TTL；字幕缓存同样只使用摘要键、160 项上限和 5 分钟 TTL。停止、屏蔽、重置或切换时清空。通用浮层的紧凑状态不显示选区原文。
 - 通用选区去重指纹只保存 PID、元素/范围标识和 SHA-256 摘要，不再把选区原文拼入指纹；暂停翻译器会同时取消选区、悬停、区域 OCR 和字幕任务并清空对应可见正文状态。
 - Release 打包会检查并拒绝包含旧网络兼容端点或调试自测入口的二进制，并启用 hardened runtime；进程读取/改写自测只存在于 Debug 构建。
-- 自动选区、悬停与自动回复扫描都不会调用 OCR。屏幕录制权限与辅助功能权限保持分离；只有用户明确选择“框选屏幕文字”、启动“视频字幕翻译”，或第二次点击 AI 回复“OCR 重试”时才会截取指定区域。OCR 图片不保存、不写剪贴板。
+- 自动选区、悬停与自动回复扫描都不会调用 OCR。屏幕录制权限与辅助功能权限保持分离；只有用户明确选择“框选屏幕文字”、启动“视频字幕翻译”，或第二次点击 AI 回复“OCR 重试”时才会截取限定区域。通用区域 OCR/字幕只包含启动流程的来源 App 窗口，拖到其他 App 不会捕获其像素；回复 OCR 使用“显示器过滤 + 仅包含目标窗口 + 近似对话区域 sourceRect”，避免先获取侧栏/工具栏的整窗像素。OCR 图片不保存、不写剪贴板。
 
 ## 构建与测试
 
@@ -263,6 +270,12 @@ NOTARY_PROFILE="your-notarytool-profile" Scripts/create-dmg.sh
 | 回复 Accessibility 读取失败（第一次点击） | 只提示“使用 OCR 重试”，不请求屏幕录制 |
 | 用户第二次明确点击 OCR 重试 | 才允许请求屏幕录制并做一次 OCR；取消权限时不截屏 |
 
+### 2026-08-09 隐私修复与本机验证
+
+- `Scripts/test.sh`：93/93 通过，覆盖回复链禁用剪贴板、同 PID Accessibility 快照、App 隐私名单、阻断期间取消、来源 App 窗口限定 OCR、字幕摘要缓存 TTL、X/Twitter 正文筛选、浏览器 AI host 白名单、同文不同轮次与长前缀流式回复失效。
+- `Scripts/run-local-regression.sh --ui --install`：SwiftPM/Xcode Release、签名与原子安装、精确 bundle 路径启动、运行时零 TCP/UDP socket 快照、离线合成 ChatGPT 输入/选区/回复、Apple 本地翻译、回复 OCR 禁用和剪贴板 change count 不变均通过。脱敏报告见 `review_artifacts/regression-20260809T032346Z.md`。
+- Computer Use 打开并核对了最终安装版 `/Users/chengwenbo/Applications/ClaudePromptTranslator.app` 的权限、回复 OCR 和不发送提示；真实 ChatGPT Classic 因自动化工具安全策略无法控制，Atlas 页面又未暴露可用的 composer Accessibility 节点，因此仍明确保留为不发送草稿的人工验收门。
+
 ### 2026-08-07 本机验证
 
 - 回复选区优先专项链通过：78 项单元测试覆盖 WebView 文本标记读取相关策略、侧栏点击隔离、同 PID 15 秒快照与主动清除；离线 ChatGPT 合成宿主实际选中 assistant 子串，验证其胜过完整最新回复，且剪贴板不变、OCR 关闭。完整 `--ui --install`、签名安装和零 TCP/UDP socket 快照均通过。脱敏报告见 `review_artifacts/regression-20260807T102319Z.md`。
@@ -283,7 +296,8 @@ NOTARY_PROFILE="your-notarytool-profile" Scripts/create-dmg.sh
 
 ## 当前明确限制
 
-- 某些浏览器或 App 既不暴露标准选区，也不暴露 WebView 文本标记选区，因此被动“翻译”按钮仍可能不出现；默认按 `⌃⌥T` 也不会绕过隐私策略。只有用户明确开启剪贴板兼容模式后，快捷键才会尝试复制 fallback。AI 回复按钮本身不会静默读取剪贴板；无法从 Accessibility 读取时只会回退到最新回复，或在用户第二次明确点击后使用 OCR。
+- 某些浏览器或 App 既不暴露标准选区，也不暴露 WebView 文本标记选区，因此被动“翻译”按钮仍可能不出现；默认按 `⌃⌥T` 也不会绕过隐私策略。只有用户明确开启剪贴板兼容模式后，通用选区快捷键才会尝试复制 fallback。AI 回复按钮无条件禁用剪贴板；无法从 Accessibility 读取时只会回退到最新回复，或在用户第二次明确点击后使用 OCR。
+- 回复 OCR 的对话矩形是按 ChatGPT、Claude 等布局比例计算的隐私收窄方案，不是 DOM 语义区域；应用改版、浮动面板、极窄窗口或跨显示器窗口可能导致正文漏截。此时应优先选中回复，或使用用户明确框选的区域 OCR，而不是放宽为整窗捕获。
 - 独立 macOS App 不能像浏览器扩展一样读取 MutationObserver、修改网页 DOM 或保留 DOM 链接/富文本节点。因此 ChatGPT/Claude 桌面端采用选区/悬停/字幕浮层；“整页原文下插入译文”“隐藏网页原文”和站点 CSS 规则仍需要浏览器扩展或 App 官方插件能力。
 - 区域 OCR 与实时字幕已经可用于 Canvas、图片和视频，但依赖屏幕录制权限、画面清晰度、字幕无遮挡和固定区域。它不会自动发现视频字幕位置，也不会识别被框选区域之外的变化。
 - 当前字幕断句是本地规则，不是外部 AI 断句；快速滚动字幕、卡拉 OK 逐字高亮、多说话人重叠或每帧变化的动画字幕仍可能等待不够稳定或出现 OCR 抖动。

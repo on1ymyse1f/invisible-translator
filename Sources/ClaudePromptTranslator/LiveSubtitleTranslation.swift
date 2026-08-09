@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import SwiftUI
 
 enum SubtitleDisplayMode: String, CaseIterable, Sendable {
@@ -105,25 +106,43 @@ struct SubtitleCueProcessor: Sendable {
 }
 
 actor SubtitleTranslationCache {
-    private var values: [String: TranslationProviderOutput] = [:]
+    private struct Entry {
+        let value: TranslationProviderOutput
+        let expiresAt: Date
+    }
+
+    private var values: [String: Entry] = [:]
     private var order: [String] = []
     private let capacity: Int
+    private let timeToLive: TimeInterval
 
-    init(capacity: Int = 160) {
+    init(capacity: Int = 160, timeToLive: TimeInterval = 300) {
         self.capacity = max(capacity, 1)
+        self.timeToLive = max(timeToLive, 1)
     }
 
-    func value(for text: String, target: TargetLanguage) -> TranslationProviderOutput? {
-        let key = cacheKey(text: text, target: target)
-        guard let value = values[key] else { return nil }
+    func value(
+        for text: String,
+        target: TargetLanguage,
+        now: Date = Date()
+    ) -> TranslationProviderOutput? {
+        removeExpiredEntries(now: now)
+        let key = Self.cacheKey(text: text, target: target)
+        guard let entry = values[key] else { return nil }
         order.removeAll { $0 == key }
         order.append(key)
-        return value
+        return entry.value
     }
 
-    func insert(_ value: TranslationProviderOutput, for text: String, target: TargetLanguage) {
-        let key = cacheKey(text: text, target: target)
-        values[key] = value
+    func insert(
+        _ value: TranslationProviderOutput,
+        for text: String,
+        target: TargetLanguage,
+        now: Date = Date()
+    ) {
+        removeExpiredEntries(now: now)
+        let key = Self.cacheKey(text: text, target: target)
+        values[key] = Entry(value: value, expiresAt: now.addingTimeInterval(timeToLive))
         order.removeAll { $0 == key }
         order.append(key)
         while order.count > capacity {
@@ -136,8 +155,23 @@ actor SubtitleTranslationCache {
         order.removeAll(keepingCapacity: false)
     }
 
-    private func cacheKey(text: String, target: TargetLanguage) -> String {
-        target.rawValue + "\u{1F}" + text
+    nonisolated static func cacheKey(text: String, target: TargetLanguage) -> String {
+        let data = Data((target.rawValue + "\u{1F}" + text).utf8)
+        return SHA256.hash(data: data)
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
+    private func removeExpiredEntries(now: Date) {
+        let expired = values.compactMap { key, entry in
+            entry.expiresAt <= now ? key : nil
+        }
+        guard !expired.isEmpty else { return }
+        let expiredSet = Set(expired)
+        for key in expiredSet {
+            values.removeValue(forKey: key)
+        }
+        order.removeAll { expiredSet.contains($0) }
     }
 }
 

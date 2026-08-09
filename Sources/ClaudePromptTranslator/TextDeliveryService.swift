@@ -11,6 +11,7 @@ enum DeliveryError: LocalizedError {
     case inputWriteVerificationFailed
     case targetAppChanged
     case clipboardCompatibilityDisabled
+    case privacyBlocked
 
     var errorDescription: String? {
         switch self {
@@ -30,6 +31,8 @@ enum DeliveryError: LocalizedError {
             return "The target app is no longer active. Nothing was replaced."
         case .clipboardCompatibilityDisabled:
             return "剪贴板兼容模式默认关闭；当前应用不支持纯 Accessibility 读写。"
+        case .privacyBlocked:
+            return "App 隐私名单已取消本次读取或写入。"
         }
     }
 }
@@ -126,8 +129,10 @@ struct TextDeliveryService {
     func deliver(
         _ text: String,
         to target: InputTarget?,
-        allowClipboardFallback: Bool = false
+        allowClipboardFallback: Bool = false,
+        authorizationCheck: @MainActor () -> Bool = { true }
     ) async throws {
+        guard authorizationCheck() else { throw DeliveryError.privacyBlocked }
         guard let target else {
             throw DeliveryError.targetInputUnavailable
         }
@@ -153,6 +158,7 @@ struct TextDeliveryService {
         try Task.checkCancellation()
         try await Task.sleep(nanoseconds: 150_000_000)
         try Task.checkCancellation()
+        guard authorizationCheck() else { throw DeliveryError.privacyBlocked }
 
         guard let pasteSelectionRange = selectedRange(in: injectionContext.focusedElement),
               pasteContextIsCurrent(
@@ -170,6 +176,7 @@ struct TextDeliveryService {
         guard NSPasteboard.general.changeCount == baselineChangeCount else {
             throw DeliveryError.inputChanged
         }
+        guard authorizationCheck() else { throw DeliveryError.privacyBlocked }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
         let ownedChangeCount = NSPasteboard.general.changeCount
@@ -184,15 +191,17 @@ struct TextDeliveryService {
         ), NSPasteboard.general.changeCount == ownedChangeCount else {
             throw DeliveryError.inputChanged
         }
+        guard authorizationCheck() else { throw DeliveryError.privacyBlocked }
         try sendPasteCommand(to: target, context: injectionContext)
         try await Task.sleep(nanoseconds: 1_200_000_000)
     }
 
     func readCurrentInput(
         from target: InputTarget?,
-        allowClipboardFallback: Bool = false
+        allowClipboardFallback: Bool = false,
+        authorizationCheck: @MainActor () -> Bool = { true }
     ) async -> InputTranslationSource? {
-        guard AccessibilityPermission.isTrusted else {
+        guard AccessibilityPermission.isTrusted, authorizationCheck() else {
             return nil
         }
 
@@ -208,6 +217,7 @@ struct TextDeliveryService {
         }
         try? await Task.sleep(nanoseconds: 120_000_000)
         guard !Task.isCancelled,
+              authorizationCheck(),
               preparedInjectionContext.isCurrent(for: target.app),
               target.matchesCurrentFocusedInput(preparedInjectionContext.focusedElement),
               !IsSecureEventInputEnabled(),
@@ -239,7 +249,8 @@ struct TextDeliveryService {
             return nil
         }
 
-        guard preparedInjectionContext.isCurrent(for: target.app) else {
+        guard authorizationCheck(),
+              preparedInjectionContext.isCurrent(for: target.app) else {
             debugLog("read:target or focus changed before keyboard fallback")
             return nil
         }
@@ -249,7 +260,8 @@ struct TextDeliveryService {
         let selectedAttempt = await copyFocusedText(
             selectAll: false,
             target: target,
-            context: injectionContext
+            context: injectionContext,
+            authorizationCheck: authorizationCheck
         )
         guard !selectedAttempt.isAmbiguous else {
             debugLog("read:selected copy ownership ambiguous")
@@ -264,7 +276,8 @@ struct TextDeliveryService {
         let focusedAttempt = await copyFocusedText(
             selectAll: true,
             target: target,
-            context: injectionContext
+            context: injectionContext,
+            authorizationCheck: authorizationCheck
         )
         guard !focusedAttempt.isAmbiguous else {
             debugLog("read:focused copy ownership ambiguous")
@@ -288,11 +301,13 @@ struct TextDeliveryService {
 
     func readCurrentInputText(
         from target: InputTarget?,
-        allowClipboardFallback: Bool = false
+        allowClipboardFallback: Bool = false,
+        authorizationCheck: @MainActor () -> Bool = { true }
     ) async -> String? {
         await readCurrentInput(
             from: target,
-            allowClipboardFallback: allowClipboardFallback
+            allowClipboardFallback: allowClipboardFallback,
+            authorizationCheck: authorizationCheck
         )?.text
     }
 
@@ -300,11 +315,13 @@ struct TextDeliveryService {
         with text: String,
         in target: InputTarget?,
         scope: InputReplacementScope = .all(expectedValue: nil),
-        allowClipboardFallback: Bool = false
+        allowClipboardFallback: Bool = false,
+        authorizationCheck: @MainActor () -> Bool = { true }
     ) async throws {
         guard AccessibilityPermission.isTrusted else {
             throw DeliveryError.accessibilityPermissionRequired
         }
+        guard authorizationCheck() else { throw DeliveryError.privacyBlocked }
         guard let target else {
             throw DeliveryError.targetInputUnavailable
         }
@@ -329,6 +346,7 @@ struct TextDeliveryService {
         defer { transactionInputGuard?.stop() }
         try await Task.sleep(nanoseconds: 180_000_000)
         try Task.checkCancellation()
+        guard authorizationCheck() else { throw DeliveryError.privacyBlocked }
 
         guard preparedInjectionContext.isCurrent(for: target.app),
               target.matchesCurrentFocusedInput(preparedInjectionContext.focusedElement),
@@ -338,7 +356,11 @@ struct TextDeliveryService {
             throw DeliveryError.inputChanged
         }
 
-        if await target.replaceTextDirectly(text, scope: scope) {
+        if await target.replaceTextDirectly(
+            text,
+            scope: scope,
+            authorizationCheck: authorizationCheck
+        ) {
             return
         }
         guard allowClipboardFallback else {
@@ -366,6 +388,7 @@ struct TextDeliveryService {
                 throw DeliveryError.inputChanged
             }
 
+            guard authorizationCheck() else { throw DeliveryError.privacyBlocked }
             target.selectAllText()
             try await Task.sleep(nanoseconds: 50_000_000)
             try sendSelectAllCommand(to: target, context: injectionContext)
@@ -373,6 +396,7 @@ struct TextDeliveryService {
 
         case .selection(let range, let expectedText):
             if let range {
+                guard authorizationCheck() else { throw DeliveryError.privacyBlocked }
                 guard target.restoreSelection(range: range, expectedText: expectedText) else {
                     throw DeliveryError.inputChanged
                 }
@@ -380,7 +404,8 @@ struct TextDeliveryService {
                 let selectedAttempt = await copyFocusedText(
                     selectAll: false,
                     target: target,
-                    context: injectionContext
+                    context: injectionContext,
+                    authorizationCheck: authorizationCheck
                 )
                 guard !selectedAttempt.isAmbiguous,
                       let selectedText = selectedAttempt.text,
@@ -407,6 +432,7 @@ struct TextDeliveryService {
         guard NSPasteboard.general.changeCount == baselineChangeCount else {
             throw DeliveryError.inputChanged
         }
+        guard authorizationCheck() else { throw DeliveryError.privacyBlocked }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
         let ownedChangeCount = NSPasteboard.general.changeCount
@@ -422,6 +448,7 @@ struct TextDeliveryService {
         ), NSPasteboard.general.changeCount == ownedChangeCount else {
             throw DeliveryError.inputChanged
         }
+        guard authorizationCheck() else { throw DeliveryError.privacyBlocked }
         try sendPasteCommand(to: target, context: injectionContext)
         try await Task.sleep(nanoseconds: 1_200_000_000)
 
@@ -465,9 +492,11 @@ struct TextDeliveryService {
     private func copyFocusedText(
         selectAll: Bool,
         target: InputTarget,
-        context: KeyboardInjectionContext
+        context: KeyboardInjectionContext,
+        authorizationCheck: @MainActor () -> Bool
     ) async -> ClipboardCopyAttempt {
-        guard context.isCurrent(for: target.app),
+        guard authorizationCheck(),
+              context.isCurrent(for: target.app),
               !IsSecureEventInputEnabled(),
               !isProtectedElementOrAncestor(context.focusedElement) else {
             return ClipboardCopyAttempt(text: nil, isAmbiguous: true)
@@ -482,6 +511,9 @@ struct TextDeliveryService {
 
         if selectAll {
             do {
+                guard authorizationCheck() else {
+                    return ClipboardCopyAttempt(text: nil, isAmbiguous: true)
+                }
                 try sendSelectAllCommand(to: target, context: context)
             } catch {
                 return ClipboardCopyAttempt(text: nil, isAmbiguous: true)
@@ -507,6 +539,9 @@ struct TextDeliveryService {
         }
 
         do {
+            guard authorizationCheck() else {
+                return ClipboardCopyAttempt(text: nil, isAmbiguous: true)
+            }
             try sendCopyCommand(to: target, context: context)
         } catch {
             return ClipboardCopyAttempt(text: nil, isAmbiguous: true)
@@ -518,7 +553,8 @@ struct TextDeliveryService {
                 return ClipboardCopyAttempt(text: nil, isAmbiguous: true)
             }
             try? await Task.sleep(nanoseconds: 25_000_000)
-            guard inputGuard.epoch == initialInputEpoch,
+            guard authorizationCheck(),
+                  inputGuard.epoch == initialInputEpoch,
                   clipboardCopyContextIsCurrent(
                       context,
                       selectedRange: copiedSelectionRange,
@@ -545,7 +581,8 @@ struct TextDeliveryService {
             selectedRange: copiedSelectionRange,
             target: target
         )
-        guard ClipboardFallbackSafety.canAcceptCopy(
+        guard authorizationCheck(),
+              ClipboardFallbackSafety.canAcceptCopy(
             baselineChangeCount: baselineChangeCount,
             observedChangeCount: observedChangeCount,
             quietChangeCount: pasteboard.changeCount,
@@ -557,7 +594,8 @@ struct TextDeliveryService {
             return ClipboardCopyAttempt(text: nil, isAmbiguous: true)
         }
 
-        guard ClipboardFallbackSafety.canRestore(
+        guard authorizationCheck(),
+              ClipboardFallbackSafety.canRestore(
             acceptedChangeCount: observedChangeCount,
             currentChangeCount: pasteboard.changeCount,
             initialInputEpoch: initialInputEpoch,

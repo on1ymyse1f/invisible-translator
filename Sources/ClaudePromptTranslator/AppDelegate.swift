@@ -305,7 +305,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let alert = NSAlert()
                 alert.alertStyle = .warning
                 alert.messageText = "开启剪贴板兼容模式？"
-                alert.informativeText = "仅在 Accessibility 无法读取或写入时，显式快捷键和 AI 兼容输入功能才会短暂借用系统通用剪贴板。内容可能被剪贴板管理器或 Universal Clipboard 观察到；因此默认关闭。"
+                alert.informativeText = "仅在 Accessibility 无法读取或写入时，显式快捷键和 AI 兼容输入功能才会短暂借用系统通用剪贴板。内容可能被剪贴板管理器或 Universal Clipboard 观察到；因此默认关闭。AI 回复翻译无论此开关是否开启，都不会读取、写入或快照剪贴板。"
                 alert.addButton(withTitle: "了解风险并开启")
                 alert.addButton(withTitle: "保持关闭")
                 guard alert.runModal() == .alertFirstButtonReturn else {
@@ -317,6 +317,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             model.clipboardCompatibilityEnabled = true
         }
         sender.state = model.clipboardCompatibilityEnabled ? .on : .off
+        configureStatusItem()
+    }
+
+    @objc private func blockFrontmostApplicationForPrivacy(_ sender: NSMenuItem) {
+        guard let processIdentifier = (sender.representedObject as? NSNumber)?.int32Value,
+              let app = NSRunningApplication(processIdentifier: processIdentifier),
+              !model.isHelperApp(app) else {
+            return
+        }
+        _ = model.blockApplicationForPrivacy(app)
+        configureStatusItem()
+    }
+
+    @objc private func allowFrontmostApplicationForPrivacy(_ sender: NSMenuItem) {
+        guard let processIdentifier = (sender.representedObject as? NSNumber)?.int32Value,
+              let app = NSRunningApplication(processIdentifier: processIdentifier) else { return }
+        _ = model.allowApplicationForPrivacy(app)
+        configureStatusItem()
+    }
+
+    @objc private func allowBlockedApplicationForPrivacy(_ sender: NSMenuItem) {
+        guard let identifier = sender.representedObject as? String else { return }
+        _ = model.allowApplicationForPrivacy(bundleIdentifier: identifier)
+        configureStatusItem()
+    }
+
+    @objc private func chooseContentFilterOff() {
+        model.contentFilterLevel = .off
+        configureStatusItem()
+    }
+
+    @objc private func chooseContentFilterBodyFirst() {
+        model.contentFilterLevel = .bodyFirst
+        configureStatusItem()
+    }
+
+    @objc private func chooseContentFilterStrict() {
+        model.contentFilterLevel = .strict
         configureStatusItem()
     }
 
@@ -340,7 +378,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let alert = NSAlert()
                 alert.alertStyle = .warning
                 alert.messageText = "开启自动回复翻译？"
-                alert.informativeText = "自动模式只通过辅助功能读取外语回复，不会截屏；翻译只调用 Apple 设备端语言包，原文不会发送到第三方服务。只有你明确点击“译回复”且辅助功能读取失败时，才会另行请求屏幕录制权限进行一次 OCR。"
+                alert.informativeText = "自动模式只通过辅助功能读取外语回复，不截屏，也不读取或写入剪贴板；翻译只调用 Apple 设备端语言包，原文不会发送到第三方服务。只有你在辅助功能读取失败后再次明确点击“OCR 重试”，才会请求屏幕录制，并仅截取目标 AI 窗口中按布局近似计算的对话区域；它可能包含同列可见历史对话，但不会截取其他 App，截图也不保存。"
                 alert.addButton(withTitle: "了解并开启")
                 alert.addButton(withTitle: "取消")
                 guard alert.runModal() == .alertFirstButtonReturn else {
@@ -595,6 +633,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         automaticLanguageItem.isEnabled = model.translatorEnabled
         menu.addItem(automaticLanguageItem)
 
+        let contentFilterMenu = NSMenu(title: "内容筛选")
+        for (title, level, action) in [
+            ("关闭", ContentFilterLevel.off, #selector(chooseContentFilterOff)),
+            ("正文优先（推荐）", ContentFilterLevel.bodyFirst, #selector(chooseContentFilterBodyFirst)),
+            ("严格", ContentFilterLevel.strict, #selector(chooseContentFilterStrict))
+        ] {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.state = model.contentFilterLevel == level ? .on : .off
+            contentFilterMenu.addItem(item)
+        }
+        let contentFilterItem = NSMenuItem(
+            title: "内容筛选: \(model.contentFilterLevel.displayName)",
+            action: nil,
+            keyEquivalent: ""
+        )
+        contentFilterItem.submenu = contentFilterMenu
+        menu.addItem(contentFilterItem)
+
         let clipboardCompatibilityItem = NSMenuItem(
             title: "允许剪贴板兼容模式（默认关闭）",
             action: #selector(toggleClipboardCompatibility(_:)),
@@ -603,6 +659,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         clipboardCompatibilityItem.state = model.clipboardCompatibilityEnabled ? .on : .off
         clipboardCompatibilityItem.isEnabled = model.translatorEnabled
         menu.addItem(clipboardCompatibilityItem)
+
+        let privacyMenu = NSMenu(title: "App 隐私名单")
+        if let frontmost = NSWorkspace.shared.frontmostApplication,
+           !model.isHelperApp(frontmost) {
+            let identifier = frontmost.bundleIdentifier ?? "无 Bundle ID"
+            if AppPrivacyPolicy.isBuiltInProtected(frontmost.bundleIdentifier) {
+                privacyMenu.addItem(disabledMenuItem("\(frontmost.localizedName ?? identifier)：内置保护"))
+            } else if model.isCaptureAllowed(in: frontmost) {
+                let item = NSMenuItem(
+                    title: "禁止读取当前 App：\(frontmost.localizedName ?? identifier)",
+                    action: #selector(blockFrontmostApplicationForPrivacy(_:)),
+                    keyEquivalent: ""
+                )
+                item.representedObject = NSNumber(value: frontmost.processIdentifier)
+                privacyMenu.addItem(item)
+            } else {
+                let item = NSMenuItem(
+                    title: "允许读取当前 App：\(frontmost.localizedName ?? identifier)",
+                    action: #selector(allowFrontmostApplicationForPrivacy(_:)),
+                    keyEquivalent: ""
+                )
+                item.representedObject = NSNumber(value: frontmost.processIdentifier)
+                privacyMenu.addItem(item)
+            }
+        } else {
+            privacyMenu.addItem(disabledMenuItem("请先切换到要管理的 App"))
+        }
+        if !model.userBlockedApplicationIdentifiers.isEmpty {
+            privacyMenu.addItem(.separator())
+            privacyMenu.addItem(disabledMenuItem("自定义禁止名单"))
+            for identifier in model.userBlockedApplicationIdentifiers {
+                let item = NSMenuItem(
+                    title: "移除：\(identifier)",
+                    action: #selector(allowBlockedApplicationForPrivacy(_:)),
+                    keyEquivalent: ""
+                )
+                item.representedObject = identifier
+                privacyMenu.addItem(item)
+            }
+        }
+        let privacyItem = NSMenuItem(title: "App 隐私名单", action: nil, keyEquivalent: "")
+        privacyItem.submenu = privacyMenu
+        menu.addItem(privacyItem)
         menu.addItem(NSMenuItem.separator())
 
         let targetMenu = NSMenu()
@@ -827,7 +926,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Target language: \(model.targetLanguage.displayName)
         Theme: \(model.appTheme.displayName)
         Accessibility trusted: \(AccessibilityPermission.isTrusted)
-        Screen recording trusted (explicit region OCR/subtitles only): \(ScreenRecordingPermission.isGranted)
+        Screen recording trusted (explicit region OCR/subtitles/reply OCR retry only): \(ScreenRecordingPermission.isGranted)
         Response translation active: \(model.hasResponseTranslationActivity)
         Contains source text, translations, app names, window titles, or clipboard data: false
         """
@@ -988,7 +1087,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if model.isHelperApp(app) {
             return
         }
-        guard !model.isHelperApp(app), model.detector.isAIContext(app) else {
+        guard model.isCaptureAllowed(in: app), model.detector.isAIContext(app) else {
             lastAutoRevealedProcessIdentifier = nil
             lastAutoRevealAt = nil
             return

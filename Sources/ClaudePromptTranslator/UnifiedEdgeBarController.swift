@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import CryptoKit
 import QuartzCore
 
 enum ResponseCaptureTrigger {
@@ -20,6 +21,13 @@ enum ResponseCapturePrivacyPolicy {
             return screenRecordingPermissionGranted
         }
     }
+
+    /// Reply capture must remain Accessibility-only. Clipboard compatibility is
+    /// reserved for explicit input/selection workflows that have their own
+    /// privacy acknowledgement and must never be inherited by “译回复”.
+    static func allowsClipboard(trigger: ResponseCaptureTrigger) -> Bool {
+        false
+    }
 }
 
 enum ResponseTranslationFreshness {
@@ -31,8 +39,26 @@ enum ResponseTranslationFreshness {
     }
 }
 
+enum ResponseTranslationIdentity {
+    static func value(for response: DetectedForeignResponse) -> String {
+        let normalizedText = response.text
+            .replacingOccurrences(of: "\u{00A0}", with: " ")
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        let identityMaterial = [
+            response.turnIdentifier ?? "no-turn",
+            response.captureSource.rawValue,
+            normalizedText
+        ].joined(separator: "\u{1F}")
+        return SHA256.hash(data: Data(identityMaterial.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+}
+
 enum ManualResponsePresentationPolicy {
-    static let retention: TimeInterval = 60
+    static let retention: TimeInterval = 12
 
     static func suppressesAutomaticScan(until: Date, now: Date = Date()) -> Bool {
         now < until
@@ -63,6 +89,7 @@ final class UnifiedEdgeBarController: NSObject {
     var responseTargetApplication: NSRunningApplication? {
         guard let currentApp,
               !currentApp.isTerminated,
+              model.isCaptureAllowed(in: currentApp),
               model.detector.isAIContext(currentApp) else {
             return nil
         }
@@ -103,8 +130,8 @@ final class UnifiedEdgeBarController: NSObject {
     private var inputTranslationTask: Task<Void, Never>?
     private var pendingResponse: DetectedForeignResponse?
     private var pendingSince: Date?
-    private var lastTranslatedSource = ""
-    private var translatingSource = ""
+    private var lastTranslatedResponseIdentity = ""
+    private var translatingResponseIdentity = ""
     private var responseTranslationGeneration: UInt64 = 0
     private var responseTranslationCache = ResponseTranslationCache(capacity: 32)
     fileprivate var manualOCRRetryAvailable = false
@@ -192,7 +219,7 @@ final class UnifiedEdgeBarController: NSObject {
         responseTranslationGeneration &+= 1
         pendingResponse = nil
         pendingSince = nil
-        translatingSource = ""
+        translatingResponseIdentity = ""
         manualOCRRetryAvailable = false
         manualResponsePresentationUntil = .distantPast
         isTranslatingResponse = false
@@ -203,7 +230,7 @@ final class UnifiedEdgeBarController: NSObject {
             latestResponseTranslation = ""
             latestResponseLanguageName = ""
             responseStatus = ""
-            lastTranslatedSource = ""
+            lastTranslatedResponseIdentity = ""
         }
     }
 
@@ -423,32 +450,23 @@ final class UnifiedEdgeBarController: NSObject {
 
     private func candidateAIApplication() -> NSRunningApplication? {
         if let frontmost = NSWorkspace.shared.frontmostApplication {
-            if !model.isHelperApp(frontmost) {
+            if model.isCaptureAllowed(in: frontmost) {
                 return model.detector.isAIContext(frontmost) ? frontmost : nil
             }
         }
 
         if let currentApp,
            !currentApp.isTerminated,
+           model.isCaptureAllowed(in: currentApp),
            model.detector.isAIContext(currentApp),
            EdgeOverlayGeometry.mainWindowRect(for: currentApp) != nil {
             return currentApp
         }
 
-        return NSWorkspace.shared.runningApplications
-            .filter { app in
-                !model.isHelperApp(app)
-                    && !app.isTerminated
-                    && model.detector.isAIContext(app)
-            }
-            .compactMap { app -> (app: NSRunningApplication, area: CGFloat)? in
-                guard let rect = EdgeOverlayGeometry.mainWindowRect(for: app) else {
-                    return nil
-                }
-                return (app, rect.width * rect.height)
-            }
-            .max { lhs, rhs in lhs.area < rhs.area }?
-            .app
+        // Do not guess a background AI application by window size. When the
+        // helper owns focus, currentApp is the only context explicitly carried
+        // over from the user's foreground window.
+        return nil
     }
 
     fileprivate var hasTranslatableInput: Bool {
@@ -478,7 +496,7 @@ final class UnifiedEdgeBarController: NSObject {
     // MARK: - Response State
 
     private func scheduleResponseScan(in app: NSRunningApplication, windowIsMoving: Bool) {
-        guard model.responseTranslationEnabled else {
+        guard model.responseTranslationEnabled, model.isCaptureAllowed(in: app) else {
             responseScanTask?.cancel()
             responseScanTask = nil
             pendingResponse = nil
@@ -491,7 +509,7 @@ final class UnifiedEdgeBarController: NSObject {
                 responseTranslationGeneration &+= 1
                 autoResponseTranslationTask?.cancel()
                 autoResponseTranslationTask = nil
-                translatingSource = ""
+                translatingResponseIdentity = ""
                 isTranslatingResponse = false
             }
             return
@@ -521,18 +539,24 @@ final class UnifiedEdgeBarController: NSObject {
                 processIdentifier: processIdentifier,
                 allowOCR: shouldAllowOCR
             )
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled,
+                  currentApp?.processIdentifier == processIdentifier,
+                  model.isCaptureAllowed(in: app) else { return }
             self.responseScanTask = nil
             self.applyScannedResponse(response, processIdentifier: processIdentifier)
         }
     }
 
     private func applyScannedResponse(_ response: DetectedForeignResponse?, processIdentifier: pid_t) {
-        guard currentApp?.processIdentifier == processIdentifier else {
+        guard currentApp?.processIdentifier == processIdentifier,
+              let app = currentApp,
+              model.isCaptureAllowed(in: app) else {
             return
         }
 
-        invalidateAutomaticResponseTranslationIfSourceChanged(to: response?.text)
+        invalidateAutomaticResponseTranslationIfSourceChanged(
+            to: response.map(ResponseTranslationIdentity.value)
+        )
 
         guard let response else {
             pendingResponse = nil
@@ -552,7 +576,8 @@ final class UnifiedEdgeBarController: NSObject {
                 return
             }
         } else {
-            let sourceTextChanged = pendingResponse?.text != response.text
+            let sourceTextChanged = pendingResponse.map(ResponseTranslationIdentity.value)
+                != ResponseTranslationIdentity.value(for: response)
             pendingResponse = response
             pendingSince = Date()
             latestResponseSource = response.text
@@ -567,15 +592,16 @@ final class UnifiedEdgeBarController: NSObject {
             return
         }
 
-        guard response.text != lastTranslatedSource,
-              response.text != translatingSource else { return }
+        let responseIdentity = ResponseTranslationIdentity.value(for: response)
+        guard responseIdentity != lastTranslatedResponseIdentity,
+              responseIdentity != translatingResponseIdentity else { return }
 
         autoTranslate(response, processIdentifier: processIdentifier)
     }
 
     private func invalidateAutomaticResponseTranslationIfSourceChanged(to incomingSource: String?) {
         guard ResponseTranslationFreshness.shouldInvalidate(
-            translatingSource: translatingSource,
+            translatingSource: translatingResponseIdentity,
             incomingSource: incomingSource
         ) else {
             return
@@ -584,18 +610,21 @@ final class UnifiedEdgeBarController: NSObject {
         responseTranslationGeneration &+= 1
         autoResponseTranslationTask?.cancel()
         autoResponseTranslationTask = nil
-        translatingSource = ""
+        translatingResponseIdentity = ""
         if manualResponseTask == nil {
             isTranslatingResponse = false
         }
     }
 
     private func autoTranslate(_ response: DetectedForeignResponse, processIdentifier: pid_t) {
-        guard currentApp?.processIdentifier == processIdentifier else {
+        guard currentApp?.processIdentifier == processIdentifier,
+              let app = currentApp,
+              model.isCaptureAllowed(in: app) else {
             return
         }
+        let responseIdentity = ResponseTranslationIdentity.value(for: response)
         if let cachedTranslation = responseTranslationCache.translation(for: response) {
-            lastTranslatedSource = response.text
+            lastTranslatedResponseIdentity = responseIdentity
             latestResponseSource = response.text
             latestResponseTranslation = cachedTranslation
             latestResponseLanguageName = response.language.displayName
@@ -607,7 +636,7 @@ final class UnifiedEdgeBarController: NSObject {
 
         responseTranslationGeneration &+= 1
         let generation = responseTranslationGeneration
-        translatingSource = response.text
+        translatingResponseIdentity = responseIdentity
         latestResponseSource = response.text
         latestResponseTranslation = ""
         latestResponseLanguageName = response.language.displayName
@@ -628,10 +657,12 @@ final class UnifiedEdgeBarController: NSObject {
             do {
                 let output = try await translator.translateToChinese(response.text)
                 guard generation == responseTranslationGeneration,
-                      translatingSource == response.text,
-                      currentApp?.processIdentifier == processIdentifier else { return }
-                translatingSource = ""
-                lastTranslatedSource = response.text
+                      translatingResponseIdentity == responseIdentity,
+                      currentApp?.processIdentifier == processIdentifier,
+                      let app = currentApp,
+                      model.isCaptureAllowed(in: app) else { return }
+                translatingResponseIdentity = ""
+                lastTranslatedResponseIdentity = responseIdentity
                 responseTranslationCache.insert(output.text, for: response)
                 latestResponseTranslation = output.text
                 responseStatus = "\(response.captureSource.displayName) · \(output.providerName) · \(response.language.displayName) → 中文"
@@ -640,9 +671,9 @@ final class UnifiedEdgeBarController: NSObject {
                 barContentView?.updateState()
             } catch {
                 guard generation == responseTranslationGeneration,
-                      translatingSource == response.text,
+                      translatingResponseIdentity == responseIdentity,
                       currentApp?.processIdentifier == processIdentifier else { return }
-                translatingSource = ""
+                translatingResponseIdentity = ""
                 latestResponseTranslation = ""
                 responseStatus = "Auto-translate failed: \(error.localizedDescription)"
                 isTranslatingResponse = false
@@ -686,7 +717,12 @@ final class UnifiedEdgeBarController: NSObject {
             do {
                 guard let source = await TextDeliveryService().readCurrentInput(
                     from: target,
-                    allowClipboardFallback: model.clipboardCompatibilityEnabled
+                    allowClipboardFallback: model.clipboardCompatibilityEnabled,
+                    authorizationCheck: { [weak self] in
+                        guard let self else { return false }
+                        return model.isCaptureAllowed(in: target.app)
+                            && currentApp?.processIdentifier == processIdentifier
+                    }
                 ) else {
                     throw DeliveryError.emptyInput
                 }
@@ -713,7 +749,12 @@ final class UnifiedEdgeBarController: NSObject {
                     with: output.text,
                     in: target,
                     scope: source.replacementScope,
-                    allowClipboardFallback: model.clipboardCompatibilityEnabled
+                    allowClipboardFallback: model.clipboardCompatibilityEnabled,
+                    authorizationCheck: { [weak self] in
+                        guard let self else { return false }
+                        return model.isCaptureAllowed(in: target.app)
+                            && currentApp?.processIdentifier == processIdentifier
+                    }
                 )
                 isTranslatingInput = false
                 model.statusMessage = source.usesSelection
@@ -767,6 +808,8 @@ final class UnifiedEdgeBarController: NSObject {
                 return "目标应用已切换，未执行替换"
             case .clipboardCompatibilityDisabled:
                 return "此输入框需手动开启剪贴板兼容模式"
+            case .privacyBlocked:
+                return "App 隐私名单已取消本次操作"
             }
         }
         return "翻译失败，请稍后重试"
@@ -782,6 +825,11 @@ final class UnifiedEdgeBarController: NSObject {
         }
         guard let app = currentApp else {
             responseStatus = "未找到当前 AI 窗口"
+            barContentView?.updateState()
+            return
+        }
+        guard model.isCaptureAllowed(in: app) else {
+            responseStatus = "隐私名单已禁止读取此应用"
             barContentView?.updateState()
             return
         }
@@ -819,25 +867,18 @@ final class UnifiedEdgeBarController: NSObject {
             // A fresh worker prevents a slow automatic OCR scan from blocking a
             // user-triggered read on the shared scan actor.
             let manualScanner = AIResponseScanWorker()
-            let explicitlyCopiedResponse = await model.captureExplicitResponseSelection(from: app)
+            // Read the live selection directly through Accessibility. Do not
+            // press the target app's Copy menu and do not snapshot, read, or
+            // write the system pasteboard from the reply workflow.
+            let directlySelectedResponse = await manualScanner.selectedForeignResponse(
+                processIdentifier: processIdentifier
+            )
             guard !Task.isCancelled,
                   generation == responseTranslationGeneration,
-                  currentApp?.processIdentifier == processIdentifier else { return }
-
-            let directlySelectedResponse: DetectedForeignResponse?
-            if explicitlyCopiedResponse == nil {
-                directlySelectedResponse = await manualScanner.selectedForeignResponse(
-                    processIdentifier: processIdentifier
-                )
-            } else {
-                directlySelectedResponse = nil
-            }
-            guard !Task.isCancelled,
-                  generation == responseTranslationGeneration,
+                  model.isCaptureAllowed(in: app),
                   currentApp?.processIdentifier == processIdentifier else { return }
 
             if directlySelectedResponse == nil,
-               explicitlyCopiedResponse == nil,
                monitoredSelectionAtAction == nil {
                 // The passive selection monitor is intentionally debounced so
                 // web views can publish their final text-marker range. Give it
@@ -846,13 +887,13 @@ final class UnifiedEdgeBarController: NSObject {
             }
             guard !Task.isCancelled,
                   generation == responseTranslationGeneration,
+                  model.isCaptureAllowed(in: app),
                   currentApp?.processIdentifier == processIdentifier else { return }
             let monitoredSelectionAfterRead = model.recentResponseSelection(
                 for: processIdentifier,
                 maximumAge: selectedResponseSnapshotLifetime
             )
             let selectedResponse = directlySelectedResponse
-                ?? explicitlyCopiedResponse
                 ?? monitoredSelectionAfterRead?.response
                 ?? monitoredSelectionAtAction?.response
             let usedSelection = selectedResponse != nil
@@ -872,7 +913,8 @@ final class UnifiedEdgeBarController: NSObject {
                     allowOCR: false
                 )
                 guard !Task.isCancelled,
-                      generation == responseTranslationGeneration else { return }
+                      generation == responseTranslationGeneration,
+                      model.isCaptureAllowed(in: app) else { return }
                 if let accessibilityResponse {
                     response = accessibilityResponse
                 } else if !shouldAttemptOCR {
@@ -901,6 +943,7 @@ final class UnifiedEdgeBarController: NSObject {
                     }
                     responseStatus = "未读到回复正文，正在进行 OCR…"
                     barContentView?.updateState()
+                    guard model.isCaptureAllowed(in: app) else { return }
                     response = await manualScanner.latestForeignResponse(
                         processIdentifier: processIdentifier,
                         allowOCR: true
@@ -909,6 +952,7 @@ final class UnifiedEdgeBarController: NSObject {
             }
             guard !Task.isCancelled,
                   generation == responseTranslationGeneration,
+                  model.isCaptureAllowed(in: app),
                   currentApp?.processIdentifier == processIdentifier else { return }
             guard let response else {
                 latestResponseSource = ""
@@ -928,7 +972,7 @@ final class UnifiedEdgeBarController: NSObject {
                 latestResponseLanguageName = response.language.displayName
                 if let cachedTranslation = responseTranslationCache.translation(for: response) {
                     latestResponseTranslation = cachedTranslation
-                    lastTranslatedSource = response.text
+                    lastTranslatedResponseIdentity = ResponseTranslationIdentity.value(for: response)
                     responseStatus = usedSelection
                         ? "选中文字 · 缓存 · \(response.language.displayName) → 中文"
                         : "缓存 · \(response.language.displayName) → 中文"
@@ -941,9 +985,10 @@ final class UnifiedEdgeBarController: NSObject {
                 barContentView?.updateState()
                 let output = try await translator.translateToChinese(response.text)
                 guard generation == responseTranslationGeneration,
+                      model.isCaptureAllowed(in: app),
                       currentApp?.processIdentifier == processIdentifier else { return }
                 latestResponseTranslation = output.text
-                lastTranslatedSource = response.text
+                lastTranslatedResponseIdentity = ResponseTranslationIdentity.value(for: response)
                 responseTranslationCache.insert(output.text, for: response)
                 responseStatus = usedSelection
                     ? "选中文字 · \(output.providerName) · \(response.language.displayName) → 中文"
@@ -966,7 +1011,7 @@ final class UnifiedEdgeBarController: NSObject {
         manualResponseTask = nil
         autoResponseTranslationTask?.cancel()
         autoResponseTranslationTask = nil
-        translatingSource = ""
+        translatingResponseIdentity = ""
         isTranslatingResponse = false
         manualOCRRetryAvailable = false
         responseStatus = "已取消回复读取"

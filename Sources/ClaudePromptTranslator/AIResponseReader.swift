@@ -72,6 +72,54 @@ struct ResponseAdapterScan: Sendable {
     let response: DetectedForeignResponse?
 }
 
+struct AIConversationCapturePlan: Equatable, Sendable {
+    let sourceRect: CGRect
+
+    static func make(
+        windowFrame: CGRect,
+        displayFrame: CGRect,
+        applicationName: String
+    ) -> AIConversationCapturePlan? {
+        guard windowFrame.width >= 120,
+              windowFrame.height >= 80,
+              !windowFrame.intersection(displayFrame).isNull else {
+            return nil
+        }
+
+        let normalizedName = applicationName.lowercased()
+        let leftRatio: CGFloat = {
+            if normalizedName.contains("claude") { return 0.30 }
+            if normalizedName.contains("chatgpt") || normalizedName.contains("gemini") { return 0.18 }
+            if normalizedName.contains("deepseek")
+                || normalizedName.contains("kimi")
+                || normalizedName.contains("doubao") {
+                return 0.16
+            }
+            return 0.14
+        }()
+        let conversationRect = CGRect(
+            x: windowFrame.minX + windowFrame.width * leftRatio,
+            y: windowFrame.minY + windowFrame.height * 0.07,
+            width: windowFrame.width * (0.96 - leftRatio),
+            height: windowFrame.height * 0.76
+        ).intersection(displayFrame).integral
+        guard !conversationRect.isNull,
+              conversationRect.width >= 12,
+              conversationRect.height >= 12 else {
+            return nil
+        }
+
+        return AIConversationCapturePlan(
+            sourceRect: CGRect(
+                x: conversationRect.minX - displayFrame.minX,
+                y: conversationRect.minY - displayFrame.minY,
+                width: conversationRect.width,
+                height: conversationRect.height
+            ).integral
+        )
+    }
+}
+
 protocol ResponseSourceAdapter: Sendable {
     var captureSource: ResponseCaptureSource { get }
 
@@ -809,13 +857,28 @@ struct AIResponseReader: Sendable {
             guard let window = content.windows.first(where: { $0.windowID == windowID }) else {
                 return nil
             }
-            let filter = SCContentFilter(desktopIndependentWindow: window)
+            guard let display = content.displays.max(by: { lhs, rhs in
+                Self.intersectionArea(window.frame, lhs.frame)
+                    < Self.intersectionArea(window.frame, rhs.frame)
+            }),
+                  let capturePlan = AIConversationCapturePlan.make(
+                    windowFrame: window.frame,
+                    displayFrame: display.frame,
+                    applicationName: app.localizedName ?? ""
+                  ) else {
+                return nil
+            }
+
+            // A desktop-independent single-window filter ignores sourceRect.
+            // Use a display filter that includes only this window so the
+            // conversation rectangle is the only pixel region captured.
+            let filter = SCContentFilter(display: display, including: [window])
             let configuration = SCStreamConfiguration()
             let scale = max(CGFloat(filter.pointPixelScale), 1)
-            configuration.width = max(Int(window.frame.width * scale), 1)
-            configuration.height = max(Int(window.frame.height * scale), 1)
+            configuration.sourceRect = capturePlan.sourceRect
+            configuration.width = max(Int(capturePlan.sourceRect.width * scale), 1)
+            configuration.height = max(Int(capturePlan.sourceRect.height * scale), 1)
             configuration.showsCursor = false
-            configuration.ignoreShadowsSingleWindow = true
             image = try await SCScreenshotManager.captureImage(
                 contentFilter: filter,
                 configuration: configuration
@@ -823,28 +886,12 @@ struct AIResponseReader: Sendable {
         } catch {
             return nil
         }
+        return image
+    }
 
-        let width = CGFloat(image.width)
-        let height = CGFloat(image.height)
-        guard width >= 420, height >= 320 else {
-            return image
-        }
-
-        let appName = app.localizedName?.lowercased() ?? ""
-        let leftRatio: CGFloat = {
-            if appName.contains("claude") { return 0.30 }
-            if appName.contains("chatgpt") || appName.contains("gemini") { return 0.18 }
-            if appName.contains("deepseek") || appName.contains("kimi") || appName.contains("doubao") { return 0.16 }
-            return 0.14
-        }()
-        let cropRect = CGRect(
-            x: width * leftRatio,
-            y: height * 0.07,
-            width: width * (0.96 - leftRatio),
-            height: height * 0.76
-        ).integral
-
-        return image.cropping(to: cropRect) ?? image
+    private static func intersectionArea(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
+        let overlap = lhs.intersection(rhs)
+        return overlap.isNull ? 0 : overlap.width * overlap.height
     }
 
     private struct OCRLine {

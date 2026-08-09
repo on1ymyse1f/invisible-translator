@@ -18,7 +18,39 @@ struct ClaudeContextDetector {
         "company.thebrowser.Browser",
         "com.microsoft.edgemac",
         "com.brave.Browser",
+        "com.openai.atlas",
         "org.mozilla.firefox"
+    ]
+
+    private static let knownDesktopAIBundleIdentifiers: Set<String> = [
+        "ai.perplexity.mac",
+        "com.anthropic.claudefordesktop",
+        "com.google.gemini",
+        "com.microsoft.copilot",
+        "com.openai.chat",
+        "local.codex.chatgptsyntheticharness"
+    ]
+
+    private static let knownDesktopAIApplicationNames: Set<String> = [
+        "chatgpt", "claude", "gemini", "perplexity", "microsoft copilot",
+        "poe", "grok", "deepseek", "kimi", "豆包", "通义千问"
+    ]
+
+    private static let knownAIWebHosts: Set<String> = [
+        "chat.openai.com",
+        "chatgpt.com",
+        "claude.ai",
+        "gemini.google.com",
+        "perplexity.ai",
+        "copilot.microsoft.com",
+        "poe.com",
+        "grok.com",
+        "chat.deepseek.com",
+        "kimi.com",
+        "kimi.moonshot.cn",
+        "doubao.com",
+        "tongyi.aliyun.com",
+        "qianwen.com"
     ]
 
     func isClaudeContext(_ app: NSRunningApplication) -> Bool {
@@ -29,7 +61,7 @@ struct ClaudeContextDetector {
             return false
         }
 
-        if name.contains("claude") || bundleIdentifier.contains("claude") || bundleIdentifier.contains("anthropic") {
+        if bundleIdentifier == "com.anthropic.claudefordesktop" || name == "claude" {
             return true
         }
 
@@ -41,7 +73,7 @@ struct ClaudeContextDetector {
             return false
         }
 
-        return frontmostWindowTitle(for: app)?.lowercased().contains("claude") == true
+        return frontmostWebURL(for: app)?.host?.lowercased() == "claude.ai"
     }
 
     func isAIContext(_ app: NSRunningApplication) -> Bool {
@@ -50,9 +82,7 @@ struct ClaudeContextDetector {
         guard !Self.isExcludedAIApp(bundleIdentifier: bundleIdentifier) else {
             return false
         }
-        let appIdentity = "\(name) \(bundleIdentifier)"
-
-        if containsAIKeyword(appIdentity) {
+        if Self.isKnownDesktopAIIdentity(name: name, bundleIdentifier: bundleIdentifier) {
             return true
         }
 
@@ -64,7 +94,33 @@ struct ClaudeContextDetector {
             return false
         }
 
-        return frontmostWindowTitle(for: app).map { containsAIKeyword($0.lowercased()) } ?? false
+        guard let url = frontmostWebURL(for: app) else {
+            // Browser window titles are untrusted content. A normal page can
+            // contain “ChatGPT”, “OpenAI” or “Grok” in its title, so automatic
+            // input/reply scanning fails closed unless AX exposes a known host.
+            return false
+        }
+        return Self.isKnownAIWebURL(url)
+    }
+
+    static func isKnownDesktopAIIdentity(name: String, bundleIdentifier: String) -> Bool {
+        knownDesktopAIBundleIdentifiers.contains(bundleIdentifier.lowercased())
+            || knownDesktopAIApplicationNames.contains(name.lowercased())
+    }
+
+    static func isKnownAIWebURL(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return false }
+        if knownAIWebHosts.contains(host) {
+            return true
+        }
+        if knownAIWebHosts.contains(where: { host.hasSuffix(".\($0)") }) {
+            return true
+        }
+        if host == "x.com" || host == "www.x.com" {
+            let path = url.path.lowercased()
+            return path == "/i/grok" || path.hasPrefix("/i/grok/")
+        }
+        return false
     }
 
     private func isSupportedBrowser(name: String, bundleIdentifier: String) -> Bool {
@@ -82,27 +138,7 @@ struct ClaudeContextDetector {
         ].contains { name.contains($0) }
     }
 
-    private func containsAIKeyword(_ text: String) -> Bool {
-        [
-            "claude",
-            "anthropic",
-            "chatgpt",
-            "openai",
-            "gemini",
-            "perplexity",
-            "copilot",
-            "poe",
-            "grok",
-            "deepseek",
-            "kimi",
-            "doubao",
-            "豆包",
-            "通义",
-            "千问"
-        ].contains { text.contains($0) }
-    }
-
-    private func frontmostWindowTitle(for app: NSRunningApplication) -> String? {
+    private func frontmostWebURL(for app: NSRunningApplication) -> URL? {
         let appElement = AXUIElementCreateApplication(app.processIdentifier)
 
         var windowReference: CFTypeRef?
@@ -125,19 +161,49 @@ struct ClaudeContextDetector {
             return nil
         }
         let windowElement = windowRef as! AXUIElement
+        var queue: [(AXUIElement, Int)] = [(windowElement, 0)]
+        var visited = 0
+        while !queue.isEmpty, visited < 500 {
+            let (element, depth) = queue.removeFirst()
+            visited += 1
+            if stringAttribute(kAXRoleAttribute, from: element) == "AXWebArea",
+               let url = urlAttribute(kAXURLAttribute, from: element) {
+                return url
+            }
+            guard depth < 12 else { continue }
+            queue.append(contentsOf: childrenAttribute(element).map { ($0, depth + 1) })
+        }
+        return nil
+    }
 
-        var titleReference: CFTypeRef?
-        let titleResult = AXUIElementCopyAttributeValue(
-            windowElement,
-            kAXTitleAttribute as CFString,
-            &titleReference
-        )
+    private func urlAttribute(_ attribute: String, from element: AXUIElement) -> URL? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success,
+              let value else { return nil }
+        if let url = value as? URL { return url }
+        if let string = value as? String { return URL(string: string) }
+        return nil
+    }
 
-        guard titleResult == .success else {
+    private func stringAttribute(_ attribute: String, from element: AXUIElement) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else {
             return nil
         }
+        return value as? String
+    }
 
-        return titleReference as? String
+    private func childrenAttribute(_ element: AXUIElement) -> [AXUIElement] {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element,
+            kAXChildrenAttribute as CFString,
+            &value
+        ) == .success,
+              let children = value as? [AXUIElement] else {
+            return []
+        }
+        return children
     }
 }
 

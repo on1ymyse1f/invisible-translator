@@ -362,7 +362,7 @@ enum SelfTestRunner {
                NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier {
                 return
             }
-            app.activate(options: [.activateIgnoringOtherApps])
+            app.activate()
             try await Task.sleep(nanoseconds: 100_000_000)
         }
         guard app.isActive,
@@ -446,6 +446,8 @@ enum SelfTestRunner {
                 return "target_app_changed"
             case .clipboardCompatibilityDisabled:
                 return "clipboard_compatibility_disabled"
+            case .privacyBlocked:
+                return "privacy_blocked"
             }
         }
         if let unavailableError = error as? TranslationProviderUnavailableError {

@@ -15,6 +15,20 @@ enum SelectionMonitorEventPolicy {
     }
 }
 
+enum SelectionMonitorPrivacyPolicy {
+    static func shouldObserve(
+        isHelperApplication: Bool,
+        isTerminated: Bool,
+        accessibilityTrusted: Bool,
+        applicationAllowed: Bool
+    ) -> Bool {
+        !isHelperApplication
+            && !isTerminated
+            && accessibilityTrusted
+            && applicationAllowed
+    }
+}
+
 private final class RetainedSelectionAXElement: @unchecked Sendable {
     let value: AXUIElement
 
@@ -71,8 +85,10 @@ private let universalSelectionEventTapCallback: CGEventTapCallBack = {
 @MainActor
 final class UniversalSelectionMonitor {
     typealias Handler = @MainActor (NSRunningApplication, SelectionCaptureHints) -> Void
+    typealias ApplicationAllowed = @MainActor (NSRunningApplication) -> Bool
 
     private let handler: Handler
+    private let isApplicationAllowed: ApplicationAllowed
     private var eventMonitor: Any?
     private var eventTap: CFMachPort?
     private var eventTapRunLoopSource: CFRunLoopSource?
@@ -89,7 +105,11 @@ final class UniversalSelectionMonitor {
     private var pendingDragEndQuartzPoint: CGPoint?
     private var activeDragStartQuartzPoint: CGPoint?
 
-    init(handler: @escaping Handler) {
+    init(
+        isApplicationAllowed: @escaping ApplicationAllowed,
+        handler: @escaping Handler
+    ) {
+        self.isApplicationAllowed = isApplicationAllowed
         self.handler = handler
     }
 
@@ -235,7 +255,8 @@ final class UniversalSelectionMonitor {
                     SelectionDiagnostics.record("helper mouse-up ignored")
                     return
             }
-            guard let app = NSWorkspace.shared.frontmostApplication else { return }
+            guard let app = NSWorkspace.shared.frontmostApplication,
+                  isApplicationAllowed(app) else { return }
             scheduleInspection(
                 for: app,
                 sourceElement: nil,
@@ -286,12 +307,27 @@ final class UniversalSelectionMonitor {
         removeAccessibilityObserver()
     }
 
+    func refreshPrivacyPolicy() {
+        if let processIdentifier = observedProcessIdentifier,
+           let observedApp = NSRunningApplication(processIdentifier: processIdentifier),
+           !isApplicationAllowed(observedApp) {
+            removeAccessibilityObserver()
+        }
+        guard let frontmost = NSWorkspace.shared.frontmostApplication,
+              isApplicationAllowed(frontmost) else {
+            return
+        }
+        observe(frontmost)
+    }
+
     fileprivate func handleAccessibilityNotification(
         _ notification: String,
         sourceElement: AXUIElement
     ) {
         guard let processIdentifier = observedProcessIdentifier,
-              let app = NSRunningApplication(processIdentifier: processIdentifier) else {
+              let app = NSRunningApplication(processIdentifier: processIdentifier),
+              isApplicationAllowed(app) else {
+            removeAccessibilityObserver()
             return
         }
 
@@ -309,9 +345,12 @@ final class UniversalSelectionMonitor {
     }
 
     private func observe(_ app: NSRunningApplication) {
-        guard app.processIdentifier != ProcessInfo.processInfo.processIdentifier,
-              !app.isTerminated,
-              AccessibilityPermission.isTrusted else {
+        guard SelectionMonitorPrivacyPolicy.shouldObserve(
+            isHelperApplication: app.processIdentifier == ProcessInfo.processInfo.processIdentifier,
+            isTerminated: app.isTerminated,
+            accessibilityTrusted: AccessibilityPermission.isTrusted,
+            applicationAllowed: isApplicationAllowed(app)
+        ) else {
             removeAccessibilityObserver()
             return
         }
@@ -414,6 +453,12 @@ final class UniversalSelectionMonitor {
         dragStartQuartzPoint: CGPoint? = nil,
         dragEndQuartzPoint: CGPoint? = nil
     ) {
+        guard isApplicationAllowed(app) else {
+            if observedProcessIdentifier == app.processIdentifier {
+                removeAccessibilityObserver()
+            }
+            return
+        }
         debounceTask?.cancel()
         let processIdentifier = app.processIdentifier
         if pendingProcessIdentifier != processIdentifier {
@@ -441,6 +486,7 @@ final class UniversalSelectionMonitor {
             guard !Task.isCancelled,
                   let self,
                   let currentApp = NSRunningApplication(processIdentifier: processIdentifier),
+                  isApplicationAllowed(currentApp),
                   NSWorkspace.shared.frontmostApplication?.processIdentifier == processIdentifier else {
                 return
             }

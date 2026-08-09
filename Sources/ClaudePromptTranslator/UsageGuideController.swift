@@ -124,7 +124,7 @@ private final class UsageGuideState: ObservableObject {
 
     func openScreenRecordingSettings() {
         ScreenRecordingPermission.openSettings()
-        actionMessage = "屏幕录制只用于你主动框选的 OCR/字幕区域，或二次确认的 AI 回复 OCR；不会后台全屏扫描。"
+        actionMessage = "屏幕录制只用于你主动框选的 OCR/字幕区域，或二次确认的 AI 回复 OCR；回复 OCR 只截取目标窗口内近似计算的对话区域，可能包含同列可见历史对话，但不会后台全屏扫描。"
     }
 
     func copySanitizedDiagnostics() {
@@ -232,7 +232,7 @@ final class UsageGuideController: NSObject, NSWindowDelegate {
     func translateAIResponseFromGuide() {
         SelectionDiagnostics.record("guide response translation requested")
         state.actionMessage = model.unifiedBarController.isManualResponseOCRRetryAvailable
-            ? "你已明确选择 OCR 重试；只会读取当前 AI 窗口区域。"
+            ? "你已明确选择 OCR 重试；只会截取当前 AI 窗口中近似计算的对话区域，可能包含同列可见历史对话。"
             : "正在优先读取同一 AI App 的选区；没有选区时才读取最新回复，本次不会使用 OCR。"
         guard let targetApplication = model.unifiedBarController.responseTargetApplication else {
             state.actionMessage = "请先在上一步选择并显示 ChatGPT、Claude 或其他 AI 窗口。"
@@ -571,7 +571,7 @@ private struct UsageGuideView: View {
                     warning: false
                 )
             }
-            Text("应用没有联网翻译后备：Apple 不支持的语言组合会明确失败。剪贴板兼容和悬停默认关闭；只有主动框选的 OCR/字幕流程会截取指定区域。")
+            Text("应用没有联网翻译后备：Apple 不支持的语言组合会明确失败。剪贴板兼容和悬停默认关闭；回复翻译从不使用剪贴板。只有主动框选的 OCR/字幕，或二次确认的回复 OCR，才会截取限定区域。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

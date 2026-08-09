@@ -276,8 +276,13 @@ final class InputTarget {
         }
     }
 
-    func replaceTextDirectly(_ replacement: String, scope: InputReplacementScope) async -> Bool {
+    func replaceTextDirectly(
+        _ replacement: String,
+        scope: InputReplacementScope,
+        authorizationCheck: @MainActor () -> Bool = { true }
+    ) async -> Bool {
         guard AccessibilityPermission.isTrusted,
+              authorizationCheck(),
               let textElement = textElementForInteraction() else {
             return false
         }
@@ -297,7 +302,8 @@ final class InputTarget {
             if let expectedValue, currentTextExactlyMatches(expectedValue) == false {
                 return false
             }
-            guard AXUIElementSetAttributeValue(
+            guard authorizationCheck(),
+                  AXUIElementSetAttributeValue(
                 textElement,
                 kAXValueAttribute as CFString,
                 replacement as CFString
@@ -318,7 +324,8 @@ final class InputTarget {
                     return false
                 }
                 let expectedValue = (value as NSString).replacingCharacters(in: range, with: replacement)
-                guard AXUIElementSetAttributeValue(
+                guard authorizationCheck(),
+                      AXUIElementSetAttributeValue(
                     textElement,
                     kAXValueAttribute as CFString,
                     expectedValue as CFString
@@ -339,7 +346,8 @@ final class InputTarget {
             let expectedValue = (value as NSString).replacingCharacters(in: range, with: replacement)
 
             var cfRange = CFRange(location: range.location, length: range.length)
-            guard let rangeValue = AXValueCreate(.cfRange, &cfRange),
+            guard authorizationCheck(),
+                  let rangeValue = AXValueCreate(.cfRange, &cfRange),
                   AXUIElementSetAttributeValue(
                     textElement,
                     kAXSelectedTextRangeAttribute as CFString,
@@ -348,7 +356,8 @@ final class InputTarget {
                 return false
             }
 
-            guard AXUIElementSetAttributeValue(
+            guard authorizationCheck(),
+                  AXUIElementSetAttributeValue(
                 textElement,
                 kAXSelectedTextAttribute as CFString,
                 replacement as CFString

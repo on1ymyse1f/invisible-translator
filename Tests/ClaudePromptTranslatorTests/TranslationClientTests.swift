@@ -4,6 +4,34 @@ import XCTest
 @testable import ClaudePromptTranslator
 
 final class TranslationClientTests: XCTestCase {
+    func testAutomaticBrowserAIContextRequiresKnownHost() throws {
+        XCTAssertTrue(
+            ClaudeContextDetector.isKnownAIWebURL(
+                try XCTUnwrap(URL(string: "https://chatgpt.com/c/example"))
+            )
+        )
+        XCTAssertTrue(
+            ClaudeContextDetector.isKnownAIWebURL(
+                try XCTUnwrap(URL(string: "https://claude.ai/new"))
+            )
+        )
+        XCTAssertFalse(
+            ClaudeContextDetector.isKnownAIWebURL(
+                try XCTUnwrap(URL(string: "https://example.com/article-about-openai"))
+            )
+        )
+        XCTAssertFalse(
+            ClaudeContextDetector.isKnownAIWebURL(
+                try XCTUnwrap(URL(string: "https://chatgpt.com.example.org/"))
+            )
+        )
+        XCTAssertFalse(
+            ClaudeContextDetector.isKnownAIWebURL(
+                try XCTUnwrap(URL(string: "https://platform.openai.com/docs"))
+            )
+        )
+    }
+
     func testUniversalSelectionLanguageRoutingIsBidirectional() {
         let chinese = SelectionLanguageRouter.route(for: "这是一个跨应用选区翻译测试。")
         let english = SelectionLanguageRouter.route(
@@ -84,6 +112,105 @@ final class TranslationClientTests: XCTestCase {
         )
     }
 
+    func testAppPrivacyPolicyBlocksBuiltInAndUserSelectedApplications() {
+        XCTAssertTrue(
+            AppPrivacyPolicy.allowsCapture(
+                bundleIdentifier: "com.openai.chat",
+                userBlockedIdentifiers: []
+            )
+        )
+        XCTAssertFalse(
+            AppPrivacyPolicy.allowsCapture(
+                bundleIdentifier: "com.1Password.1Password",
+                userBlockedIdentifiers: []
+            )
+        )
+        XCTAssertFalse(
+            AppPrivacyPolicy.allowsCapture(
+                bundleIdentifier: "com.example.PrivateNotes",
+                userBlockedIdentifiers: ["COM.EXAMPLE.PRIVATENOTES"]
+            )
+        )
+        XCTAssertFalse(
+            AppPrivacyPolicy.allowsCapture(bundleIdentifier: nil, userBlockedIdentifiers: [])
+        )
+    }
+
+    func testSelectionMonitorPrivacyPolicyNeverObservesBlockedApplication() {
+        XCTAssertTrue(
+            SelectionMonitorPrivacyPolicy.shouldObserve(
+                isHelperApplication: false,
+                isTerminated: false,
+                accessibilityTrusted: true,
+                applicationAllowed: true
+            )
+        )
+        XCTAssertFalse(
+            SelectionMonitorPrivacyPolicy.shouldObserve(
+                isHelperApplication: false,
+                isTerminated: false,
+                accessibilityTrusted: true,
+                applicationAllowed: false
+            )
+        )
+    }
+
+    func testXContentFilterKeepsPostBodyAndDropsInterfaceMetadata() throws {
+        let source = """
+        Example Author
+        @example_user
+        2h
+        I like being home when I reply to thoughtful posts. This sentence is the actual content.
+        1.2K views
+        Re\u{200B}ply
+        Share
+        """
+
+        let result = try XCTUnwrap(
+            TranslationContentFilter.filter(
+                source,
+                level: .bodyFirst,
+                intent: .hover,
+                appName: "Safari",
+                windowTitle: "Example Author on X: post / X"
+            )
+        )
+
+        XCTAssertTrue(result.text.contains("I like being home when I reply"))
+        XCTAssertTrue(result.text.contains("Example Author"))
+        XCTAssertFalse(result.text.contains("@example_user"))
+        XCTAssertFalse(result.text.contains("1.2K views"))
+        XCTAssertFalse(result.text.contains("\nReply"))
+        XCTAssertEqual(result.profileIdentifier, "x-twitter")
+        XCTAssertEqual(result.removedLineCount, 5)
+    }
+
+    func testContentFilterDoesNotGuessAWebsiteOrOverrideExplicitSelection() throws {
+        let mixed = "Home\nThis is important text.\nReply"
+        let generic = try XCTUnwrap(
+            TranslationContentFilter.filter(
+                mixed,
+                level: .bodyFirst,
+                intent: .hover,
+                appName: "Safari",
+                windowTitle: "A normal documentation page"
+            )
+        )
+        XCTAssertEqual(generic.text, mixed)
+
+        let explicit = try XCTUnwrap(
+            TranslationContentFilter.filter(
+                "Reply",
+                level: .strict,
+                intent: .explicitSelection,
+                appName: "X",
+                windowTitle: "Home / X"
+            )
+        )
+        XCTAssertEqual(explicit.text, "Reply")
+        XCTAssertEqual(explicit.profileIdentifier, "explicit")
+    }
+
     func testHoverSnippetPrefersParagraphAroundPointerLocation() {
         let first = String(repeating: "A", count: 300)
         let middle = "This is the paragraph under the pointer."
@@ -125,6 +252,84 @@ final class TranslationClientTests: XCTestCase {
             region.sourceRect,
             CGRect(x: 120, y: 600, width: 500, height: 140)
         )
+    }
+
+    func testScreenRegionCaptureMustIntersectSourceApplicationWindow() {
+        let display = CGRect(x: 1_440, y: 0, width: 1_280, height: 800)
+        let selected = CGRect(x: 100, y: 120, width: 320, height: 140)
+
+        XCTAssertTrue(
+            ScreenRegionSourceWindowPolicy.intersectsSourceWindow(
+                sourceRect: selected,
+                displayFrame: display,
+                sourceWindowFrames: [CGRect(x: 1_500, y: 80, width: 900, height: 620)]
+            )
+        )
+        XCTAssertFalse(
+            ScreenRegionSourceWindowPolicy.intersectsSourceWindow(
+                sourceRect: selected,
+                displayFrame: display,
+                sourceWindowFrames: [CGRect(x: 2_300, y: 500, width: 300, height: 220)]
+            )
+        )
+    }
+
+    func testReplyOCRCapturePlanUsesOnlyConversationRectangle() throws {
+        let plan = try XCTUnwrap(
+            AIConversationCapturePlan.make(
+                windowFrame: CGRect(x: 100, y: 80, width: 1_000, height: 800),
+                displayFrame: CGRect(x: 0, y: 0, width: 1_440, height: 900),
+                applicationName: "ChatGPT"
+            )
+        )
+
+        XCTAssertEqual(plan.sourceRect, CGRect(x: 280, y: 136, width: 780, height: 608))
+        XCTAssertLessThan(plan.sourceRect.width, 1_000)
+        XCTAssertLessThan(plan.sourceRect.height, 800)
+    }
+
+    func testReplyOCRCapturePlanConvertsToSecondaryDisplayCoordinates() throws {
+        let plan = try XCTUnwrap(
+            AIConversationCapturePlan.make(
+                windowFrame: CGRect(x: 1_500, y: 100, width: 800, height: 600),
+                displayFrame: CGRect(x: 1_440, y: 0, width: 1_280, height: 800),
+                applicationName: "Claude"
+            )
+        )
+
+        XCTAssertEqual(plan.sourceRect, CGRect(x: 300, y: 142, width: 528, height: 456))
+    }
+
+    func testSubtitleCacheUsesDigestTTLAndExplicitClear() async {
+        let cache = SubtitleTranslationCache(capacity: 2, timeToLive: 2)
+        let source = "private subtitle source"
+        let output = TranslationProviderOutput(text: "本地译文", providerName: "test")
+        let start = Date(timeIntervalSince1970: 1_000)
+        let key = SubtitleTranslationCache.cacheKey(text: source, target: .simplifiedChinese)
+
+        XCTAssertEqual(key.count, 64)
+        XCTAssertFalse(key.contains(source))
+        await cache.insert(output, for: source, target: .simplifiedChinese, now: start)
+        let freshValue = await cache.value(
+            for: source,
+            target: .simplifiedChinese,
+            now: start.addingTimeInterval(1)
+        )
+        XCTAssertEqual(freshValue, output)
+        let expiredValue = await cache.value(
+            for: source,
+            target: .simplifiedChinese,
+            now: start.addingTimeInterval(3)
+        )
+        XCTAssertNil(expiredValue)
+        await cache.insert(output, for: source, target: .simplifiedChinese, now: start)
+        await cache.removeAll()
+        let clearedValue = await cache.value(
+            for: source,
+            target: .simplifiedChinese,
+            now: start
+        )
+        XCTAssertNil(clearedValue)
     }
 
     func testVisionOCRRecognizesSyntheticHighContrastText() throws {
@@ -992,6 +1197,20 @@ final class TranslationClientTests: XCTestCase {
         )
     }
 
+    func testResponseCaptureNeverAuthorizesClipboardAccess() {
+        XCTAssertFalse(ResponseCapturePrivacyPolicy.allowsClipboard(trigger: .automatic))
+        XCTAssertFalse(ResponseCapturePrivacyPolicy.allowsClipboard(trigger: .manualAccessibilityRead))
+        XCTAssertFalse(ResponseCapturePrivacyPolicy.allowsClipboard(trigger: .explicitOCRRetry))
+    }
+
+    func testResponseSelectionSnapshotAcceptsOnlyAccessibilityCapture() {
+        XCTAssertTrue(ResponseSelectionSnapshotCapturePolicy.allows(.accessibility))
+        XCTAssertFalse(ResponseSelectionSnapshotCapturePolicy.allows(.menuCopyFallback))
+        XCTAssertFalse(ResponseSelectionSnapshotCapturePolicy.allows(.clipboardFallback))
+        XCTAssertFalse(ResponseSelectionSnapshotCapturePolicy.allows(.hoverAccessibility))
+        XCTAssertFalse(ResponseSelectionSnapshotCapturePolicy.allows(.screenOCR))
+    }
+
     func testStreamingResponseInvalidatesAnOlderPartialTranslation() {
         XCTAssertTrue(
             ResponseTranslationFreshness.shouldInvalidate(
@@ -1020,6 +1239,45 @@ final class TranslationClientTests: XCTestCase {
                 until: now,
                 now: now
             )
+        )
+        XCTAssertLessThanOrEqual(ManualResponsePresentationPolicy.retention, 15)
+    }
+
+    func testSameResponseTextInDifferentTurnsHasDifferentIdentity() {
+        let first = DetectedForeignResponse(
+            text: "Sure.",
+            language: .english,
+            captureSource: .chatGPTAccessibility,
+            turnIdentifier: "chatgpt|assistant|41"
+        )
+        let second = DetectedForeignResponse(
+            text: "Sure.",
+            language: .english,
+            captureSource: .chatGPTAccessibility,
+            turnIdentifier: "chatgpt|assistant|42"
+        )
+
+        XCTAssertNotEqual(
+            ResponseTranslationIdentity.value(for: first),
+            ResponseTranslationIdentity.value(for: second)
+        )
+
+        let stablePrefix = String(repeating: "A", count: 90)
+        let partial = DetectedForeignResponse(
+            text: stablePrefix + " partial",
+            language: .english,
+            captureSource: .chatGPTAccessibility,
+            turnIdentifier: "chatgpt|assistant|same-marker"
+        )
+        let completed = DetectedForeignResponse(
+            text: stablePrefix + " completed response",
+            language: .english,
+            captureSource: .chatGPTAccessibility,
+            turnIdentifier: "chatgpt|assistant|same-marker"
+        )
+        XCTAssertNotEqual(
+            ResponseTranslationIdentity.value(for: partial),
+            ResponseTranslationIdentity.value(for: completed)
         )
     }
 
