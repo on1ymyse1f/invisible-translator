@@ -515,7 +515,7 @@ private struct UsageGuideView: View {
             VStack(alignment: .leading, spacing: 5) {
                 Text("两周本机语言偏好")
                     .font(.headline)
-                Text("从第一次成功的主动翻译开始计时；满 14 天且至少 8 次、某方向达到 67% 后，自动语言路由才会采用该偏好。只保存评估时间、语言代码和聚合次数/分数，不保存原文、译文、App 或窗口信息。自动回复、自动选区、悬停和字幕不会计入。")
+                Text("从第一次成功的主动翻译开始计时；满 14 天且至少 8 次、某方向达到 67% 后，自动语言路由才会采用该偏好。只保存评估时间、语言代码和聚合次数/分数，不保存原文、译文、App 或窗口信息。回复翻译、自动选区、悬停和字幕不会计入。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
