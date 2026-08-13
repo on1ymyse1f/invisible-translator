@@ -2,6 +2,13 @@ import AppKit
 import ApplicationServices
 import Carbon.HIToolbox
 
+enum AppLaunchEnvironmentPolicy {
+    static func isUnitTestHost(_ environment: [String: String]) -> Bool {
+        environment["XCTestConfigurationFilePath"] != nil
+            || environment["XCTestBundlePath"] != nil
+    }
+}
+
 @main
 enum ClaudePromptTranslatorMain {
     static func main() {
@@ -21,13 +28,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotKeyRef: EventHotKeyRef?
     private var hotKeyEventHandler: EventHandlerRef?
     private var activationObserver: NSObjectProtocol?
+    private var runtimeStateObservers: [NSObjectProtocol] = []
     private var showExistingInstanceObserver: NSObjectProtocol?
-    private var contextTimer: Timer?
     private var existingInstanceAtLaunch: NSRunningApplication?
     private var handledIncomingURL = false
     private var lastAutoRevealedProcessIdentifier: pid_t?
     private var lastAutoRevealAt: Date?
     private lazy var usageGuideController = UsageGuideController(model: model)
+    private lazy var storagePerformanceController = StoragePerformanceController()
+    private let updateCoordinator = UpdateCoordinator()
+    private var updateDeadlineTask: Task<Void, Never>?
+    private var updateReleaseTask: Task<Void, Never>?
     private let hotKeySignature = OSType(0x43505431) // "CPT1"
     private let hotKeyID = UInt32(1)
     private let showExistingInstanceNotification = Notification.Name("local.codex.ClaudePromptTranslator.show")
@@ -49,16 +60,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 #endif
 
+        // Xcode's app-hosted unit tests load this delegate into an executable
+        // with the production bundle identifier. Starting single-instance
+        // handling there can terminate the test runner when an installed copy
+        // is open; timers, hotkeys and observers are unnecessary as well.
+        guard !AppLaunchEnvironmentPolicy.isUnitTestHost(
+            ProcessInfo.processInfo.environment
+        ) else {
+            return
+        }
+
         existingInstanceAtLaunch = findExistingInstance()
 
         configureSingleInstanceObserver()
         configureStatusItem()
         configureHotkeys()
         configureClaudeDetection()
-        model.startSelectionMonitoring()
-        if model.translatorEnabled, model.unifiedBarEnabled {
-            model.unifiedBarController.start()
-        }
+        configureRuntimeStateObservation()
+        model.startRuntimeCoordination()
+        scheduleUpdateDeadlineTask()
         scheduleInitialAIRevealChecks()
         model.statusMessage = AccessibilityPermission.isTrusted
             ? "已就绪：在任意 App 选中文字，点击浮动“翻译”或按 ⌃⌥T。"
@@ -138,13 +158,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let activationObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(activationObserver)
         }
+        for observer in runtimeStateObservers {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
+        runtimeStateObservers.removeAll()
         if let showExistingInstanceObserver {
             DistributedNotificationCenter.default().removeObserver(showExistingInstanceObserver)
         }
-        contextTimer?.invalidate()
+        updateDeadlineTask?.cancel()
+        updateReleaseTask?.cancel()
+        updateCoordinator.releaseUpdaterAfterCheck()
         model.stopSelectionMonitoring()
         model.dismissSelectionOverlay()
-        model.unifiedBarController.stop()
+        model.stopUnifiedBar()
+        model.stopRuntimeCoordination()
     }
 
     @objc private func showInputPanel() {
@@ -153,6 +180,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showUsageGuide() {
         usageGuideController.show()
+    }
+
+    @objc private func showStoragePerformance() {
+        storagePerformanceController.show()
+    }
+
+    @objc private func checkForUpdates() {
+        guard updateCoordinator.isUpdaterAvailable else {
+            model.statusMessage = "当前轻量基础构建未包含 Sparkle 更新组件；不会联网检查更新。"
+            configureStatusItem()
+            return
+        }
+
+        do {
+            try updateCoordinator.performUserInitiatedCheck()
+            model.statusMessage = "已按你的请求检查更新；不会上传文本、译文、设备标识或使用画像。"
+            scheduleUpdateDeadlineTask()
+            scheduleUpdaterRelease()
+        } catch {
+            model.statusMessage = (error as? LocalizedError)?.errorDescription ?? "无法启动更新检查。"
+        }
+        configureStatusItem()
     }
 
     @objc private func revealEdgeBar() {
@@ -164,11 +213,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func translateLatestResponse() {
-        model.unifiedBarController.translateLatestResponse()
+        model.translateLatestResponseFromBar()
     }
 
     @objc private func copyLatestResponse() {
-        model.unifiedBarController.copyResponseTranslation()
+        model.copyLatestResponseFromBar()
     }
 
     @objc private func translateCurrentSelection() {
@@ -403,9 +452,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.unifiedBarEnabled.toggle()
         sender.state = model.unifiedBarEnabled ? .on : .off
         if model.translatorEnabled, model.unifiedBarEnabled {
-            model.unifiedBarController.start()
+            model.startUnifiedBar()
         } else {
-            model.unifiedBarController.stop()
+            model.stopUnifiedBar()
             model.clearResponseTranslation()
         }
         configureStatusItem()
@@ -497,9 +546,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func restartEdgeBar() {
-        model.unifiedBarController.stop()
+        model.stopUnifiedBar()
         if model.translatorEnabled, model.unifiedBarEnabled {
-            model.unifiedBarController.start()
+            model.startUnifiedBar()
             model.revealEdgeBar()
             model.statusMessage = "边缘栏已重启。"
         } else {
@@ -518,6 +567,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSPasteboard.general.setString(debugInfoText(), forType: .string)
         model.statusMessage = "脱敏诊断已复制。"
         configureStatusItem()
+    }
+
+    /// Installs one cancellable 24-hour deadline. The initial call only stores
+    /// a timestamp, so launch itself never creates Sparkle or opens a socket.
+    private func scheduleUpdateDeadlineTask() {
+        updateDeadlineTask?.cancel()
+        guard let deadline = updateCoordinator.scheduleInitialDeadlineIfNeeded() else {
+            return
+        }
+
+        let delay = max(0, deadline.timeIntervalSinceNow)
+        let nanoseconds = UInt64(min(delay * 1_000_000_000, Double(UInt64.max)))
+        updateDeadlineTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: nanoseconds)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, let self else { return }
+
+            do {
+                if try self.updateCoordinator.performScheduledCheck() {
+                    self.model.statusMessage = "已按 24 小时间隔检查更新。"
+                    self.scheduleUpdaterRelease()
+                }
+            } catch {
+                self.model.statusMessage = (error as? LocalizedError)?.errorDescription ?? "自动更新检查未能启动。"
+            }
+            self.configureStatusItem()
+            self.scheduleUpdateDeadlineTask()
+        }
+    }
+
+    /// Sparkle is only retained while its standard interaction can be visible.
+    /// Releasing it later keeps the lightweight app from retaining an updater
+    /// controller or background updater between checks.
+    private func scheduleUpdaterRelease() {
+        updateReleaseTask?.cancel()
+        updateReleaseTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: 120 * 1_000_000_000)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            self?.updateCoordinator.releaseUpdaterAfterCheck()
+        }
     }
 
     private func configureStatusItem() {
@@ -865,7 +961,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let diagnosticsMenu = NSMenu(title: "状态与故障诊断")
         diagnosticsMenu.addItem(disabledMenuItem("辅助功能权限: \(AccessibilityPermission.isTrusted ? "已授权" : "未授权")"))
         diagnosticsMenu.addItem(disabledMenuItem("屏幕录制权限: \(ScreenRecordingPermission.isGranted ? "已授权" : "未授权（仅影响 OCR）")"))
-        diagnosticsMenu.addItem(disabledMenuItem("边缘栏运行: \(model.unifiedBarController.isRunning ? "运行中" : "未运行")"))
+        diagnosticsMenu.addItem(disabledMenuItem("边缘栏运行: \(model.isUnifiedBarRunning ? "运行中" : "未运行")"))
         diagnosticsMenu.addItem(disabledMenuItem("选区被动识别: \(model.selectionDetectionEnabled ? "已开启" : "已关闭")"))
         diagnosticsMenu.addItem(disabledMenuItem("选中即翻译: \(model.automaticSelectionTranslationEnabled ? "已开启" : "已关闭")"))
         diagnosticsMenu.addItem(disabledMenuItem("鼠标悬停翻译: \(model.hoverTranslationEnabled ? "已开启" : "已关闭")"))
@@ -899,6 +995,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let clearReplyItem = NSMenuItem(title: "清除回复译文", action: #selector(clearResponseTranslation), keyEquivalent: "")
         clearReplyItem.isEnabled = model.translatorEnabled && model.hasResponseTranslationActivity
         moreMenu.addItem(clearReplyItem)
+        moreMenu.addItem(NSMenuItem.separator())
+        moreMenu.addItem(NSMenuItem(title: "存储与性能…", action: #selector(showStoragePerformance), keyEquivalent: ""))
+        let updateTitle = updateCoordinator.isUpdaterAvailable
+            ? "检查更新…"
+            : "检查更新（当前构建未包含更新器）"
+        moreMenu.addItem(NSMenuItem(title: updateTitle, action: #selector(checkForUpdates), keyEquivalent: ""))
         moreMenu.addItem(NSMenuItem.separator())
         moreMenu.addItem(NSMenuItem(title: "请求辅助功能权限", action: #selector(requestAccessibilityPermission), keyEquivalent: ""))
         moreMenu.addItem(NSMenuItem(title: "打开辅助功能设置", action: #selector(openAccessibilitySettings), keyEquivalent: ""))
@@ -987,7 +1089,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Apple local translation: available
         Translator enabled: \(model.translatorEnabled)
         Unified edge bar enabled: \(model.unifiedBarEnabled)
-        Unified edge bar running: \(model.unifiedBarController.isRunning)
+        Unified edge bar running: \(model.isUnifiedBarRunning)
         Selection detection enabled: \(model.selectionDetectionEnabled)
         Automatic selection translation enabled: \(model.automaticSelectionTranslationEnabled)
         Hover translation enabled: \(model.hoverTranslationEnabled)
@@ -1123,10 +1225,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        contextTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.showEdgeBarIfAIIsActive(forceReveal: false)
-            }
+    }
+
+    private func configureRuntimeStateObservation() {
+        let center = NSWorkspace.shared.notificationCenter
+        for name in [
+            NSWorkspace.willSleepNotification,
+            NSWorkspace.sessionDidResignActiveNotification
+        ] {
+            runtimeStateObservers.append(
+                center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    Task { @MainActor in self?.model.setRuntimeSuspended(true) }
+                }
+            )
+        }
+        for name in [
+            NSWorkspace.didWakeNotification,
+            NSWorkspace.sessionDidBecomeActiveNotification
+        ] {
+            runtimeStateObservers.append(
+                center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    Task { @MainActor in self?.model.setRuntimeSuspended(false) }
+                }
+            )
         }
     }
 
@@ -1142,6 +1263,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let app = NSRunningApplication(processIdentifier: processIdentifier) else {
             return
         }
+        model.reconcileRuntime(foregroundApplication: app)
         if !model.isHelperApp(app) {
             model.rememberTarget(app)
         }

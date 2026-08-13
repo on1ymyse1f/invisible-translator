@@ -77,13 +77,18 @@ final class UnifiedEdgeBarController: NSObject {
 
     // MARK: - Panels
 
-    private lazy var barPanel = makeBarPanel()
+    private var barPanel: NSPanel?
     private var barContentView: UnifiedBarContentView?
     private let responseScanner = AIResponseScanWorker()
 
     // MARK: - State (fileprivate so UnifiedBarContentView can read)
 
-    private var timer: Timer?
+    private var lifecycleRunning = false
+    private var watchdogTask: Task<Void, Never>?
+    private var panelReleaseTask: Task<Void, Never>?
+    private var globalPointerMonitor: Any?
+    private var localPointerMonitor: Any?
+    private var lastPointerRefresh = Date.distantPast
     private var currentApp: NSRunningApplication?
 
     var responseTargetApplication: NSRunningApplication? {
@@ -132,8 +137,13 @@ final class UnifiedEdgeBarController: NSObject {
     private var pendingSince: Date?
     private var lastTranslatedResponseIdentity = ""
     private var translatingResponseIdentity = ""
+    private var responseScanGeneration: UInt64 = 0
     private var responseTranslationGeneration: UInt64 = 0
-    private var responseTranslationCache = ResponseTranslationCache(capacity: 32)
+    private var responseTranslationCache = ResponseTranslationCache(
+        capacity: 16,
+        timeToLive: 180,
+        maximumByteCount: 1_048_576
+    )
     fileprivate var manualOCRRetryAvailable = false
     private let selectedResponseSnapshotLifetime = ResponseSelectionSnapshotPolicy.maximumRetention
     fileprivate var latestResponseSource: String {
@@ -174,21 +184,20 @@ final class UnifiedEdgeBarController: NSObject {
 
     func start() {
         stop()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.refresh()
-            }
-        }
-        refresh()
+        lifecycleRunning = true
+        refreshNow()
+        armWatchdog()
     }
 
     var isRunning: Bool {
-        timer != nil
+        lifecycleRunning
     }
 
     func stop() {
-        timer?.invalidate()
-        timer = nil
+        lifecycleRunning = false
+        watchdogTask?.cancel()
+        watchdogTask = nil
+        removePointerMonitors()
         inputAccessibilityObserver?.stop()
         inputAccessibilityObserver = nil
         forceVisibleUntil = nil
@@ -202,6 +211,7 @@ final class UnifiedEdgeBarController: NSObject {
         cachedInputIsInferred = false
         cachedUsesSelectedInput = false
         hideBar()
+        releaseBarPanel()
     }
 
     func clearResponseTranslation() {
@@ -209,7 +219,17 @@ final class UnifiedEdgeBarController: NSObject {
         barContentView?.updateState()
     }
 
+    func trimCachesForMemoryPressure() {
+        responseTranslationCache.removeAll()
+    }
+
+    func releaseHiddenResources() {
+        guard !isBarVisible else { return }
+        releaseBarPanel()
+    }
+
     private func resetResponseContext(clearDisplayedContent: Bool) {
+        responseScanGeneration &+= 1
         responseScanTask?.cancel()
         responseScanTask = nil
         manualResponseTask?.cancel()
@@ -235,7 +255,7 @@ final class UnifiedEdgeBarController: NSObject {
     }
 
     func revealTemporarily(duration: TimeInterval = 8.0) {
-        if timer == nil {
+        if !lifecycleRunning {
             start()
         }
         forceVisibleUntil = Date().addingTimeInterval(duration)
@@ -245,14 +265,19 @@ final class UnifiedEdgeBarController: NSObject {
     // MARK: - Main Refresh
 
     func refresh() {
+        guard lifecycleRunning else { return }
+        refreshNow()
+        armWatchdog()
+    }
+
+    private func refreshNow() {
         guard model.translatorEnabled else {
             hideBar()
             return
         }
 
-        applyThemeIfNeeded()
-
         guard AccessibilityPermission.isTrusted else {
+            removePointerMonitors()
             hideBar()
             return
         }
@@ -270,6 +295,7 @@ final class UnifiedEdgeBarController: NSObject {
             currentInputTarget = nil
             inputAccessibilityObserver?.stop()
             inputAccessibilityObserver = nil
+            removePointerMonitors()
             lastObservedAIProcessIdentifier = nil
             lastWindowRect = nil
             cachedHasTranslatableInput = false
@@ -287,8 +313,14 @@ final class UnifiedEdgeBarController: NSObject {
             && observedWindowIdentity != nil
             && currentWindowIdentity != observedWindowIdentity
         currentApp = app
-        if applicationChanged {
+        installPointerMonitorsIfNeeded()
+        if model.selectionMonitorOwnsAXObserver(for: app.processIdentifier) {
+            inputAccessibilityObserver?.stop()
+            inputAccessibilityObserver = nil
+        } else if applicationChanged || inputAccessibilityObserver == nil {
             installInputAccessibilityObserver(for: app)
+        }
+        if applicationChanged {
             currentWindowIdentity = observedWindowIdentity
         } else if let observedWindowIdentity {
             currentWindowIdentity = observedWindowIdentity
@@ -357,7 +389,7 @@ final class UnifiedEdgeBarController: NSObject {
 
         let shouldShow = isForcedVisible || EdgeOverlayGeometry.isMouseNearWindowEdge(
             windowRect: windowRect,
-            activeFrames: isBarVisible ? [barPanel.frame] : [],
+            activeFrames: isBarVisible ? barPanel.map { [$0.frame] } ?? [] : [],
             edgeThickness: 90
         ) || isTranslatingInput || isTranslatingResponse || isExpansionHeld
 
@@ -376,6 +408,53 @@ final class UnifiedEdgeBarController: NSObject {
             }
             hideBar()
         }
+    }
+
+    private func armWatchdog() {
+        watchdogTask?.cancel()
+        guard lifecycleRunning else { return }
+        let interval: Duration = currentApp == nil ? .seconds(15) : .seconds(2)
+        watchdogTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: interval)
+            } catch {
+                return
+            }
+            guard let self, lifecycleRunning else { return }
+            refreshNow()
+            armWatchdog()
+        }
+    }
+
+    private func installPointerMonitorsIfNeeded() {
+        guard globalPointerMonitor == nil, localPointerMonitor == nil else { return }
+        let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged]
+        globalPointerMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] _ in
+            Task { @MainActor in self?.handlePointerMovement() }
+        }
+        localPointerMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
+            Task { @MainActor in self?.handlePointerMovement() }
+            return event
+        }
+    }
+
+    private func removePointerMonitors() {
+        if let globalPointerMonitor {
+            NSEvent.removeMonitor(globalPointerMonitor)
+            self.globalPointerMonitor = nil
+        }
+        if let localPointerMonitor {
+            NSEvent.removeMonitor(localPointerMonitor)
+            self.localPointerMonitor = nil
+        }
+    }
+
+    private func handlePointerMovement() {
+        guard lifecycleRunning, currentApp != nil else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastPointerRefresh) >= 0.1 else { return }
+        lastPointerRefresh = now
+        refreshNow()
     }
 
     // MARK: - Input State
@@ -530,6 +609,8 @@ final class UnifiedEdgeBarController: NSObject {
         }
         guard Date().timeIntervalSince(lastAutoScan) >= autoScanInterval else { return }
         lastAutoScan = Date()
+        responseScanGeneration &+= 1
+        let scanGeneration = responseScanGeneration
 
         let processIdentifier = app.processIdentifier
         // Automatic reply detection is Accessibility-only. OCR can capture the
@@ -541,6 +622,11 @@ final class UnifiedEdgeBarController: NSObject {
 
         responseScanTask = Task { [weak self] in
             guard let self else { return }
+            defer {
+                if responseScanGeneration == scanGeneration {
+                    responseScanTask = nil
+                }
+            }
             let response = await self.responseScanner.latestForeignResponse(
                 processIdentifier: processIdentifier,
                 allowOCR: shouldAllowOCR
@@ -548,7 +634,6 @@ final class UnifiedEdgeBarController: NSObject {
             guard !Task.isCancelled,
                   currentApp?.processIdentifier == processIdentifier,
                   model.isCaptureAllowed(in: app) else { return }
-            self.responseScanTask = nil
             self.applyScannedResponse(response, processIdentifier: processIdentifier)
         }
     }
@@ -661,7 +746,10 @@ final class UnifiedEdgeBarController: NSObject {
                 }
             }
             do {
-                let output = try await translator.translateToChinese(response.text)
+                let output = try await translator.translateToChinese(
+                    response.text,
+                    workKind: .automaticResponse
+                )
                 guard generation == responseTranslationGeneration,
                       translatingResponseIdentity == responseIdentity,
                       currentApp?.processIdentifier == processIdentifier,
@@ -1061,6 +1149,7 @@ final class UnifiedEdgeBarController: NSObject {
     // MARK: - Expand / Collapse
 
     private var isMouseOverBar: Bool {
+        guard let barPanel else { return false }
         let mouse = NSEvent.mouseLocation
         return barPanel.frame.insetBy(dx: -12, dy: -12).contains(mouse)
     }
@@ -1068,6 +1157,10 @@ final class UnifiedEdgeBarController: NSObject {
     // MARK: - Bar Visibility & Positioning
 
     private func showBar(at windowRect: NSRect, windowIsMoving: Bool) {
+        panelReleaseTask?.cancel()
+        panelReleaseTask = nil
+        let barPanel = ensureBarPanel()
+        applyThemeIfNeeded()
         let size = isExpanded ? Self.expandedSize : Self.collapsedSize
         let origin = barOrigin(for: size, windowRect: windowRect)
         let frame = NSRect(origin: origin, size: size).roundedForOverlayPlacement()
@@ -1090,10 +1183,14 @@ final class UnifiedEdgeBarController: NSObject {
     }
 
     private func hideBar() {
-        guard isBarVisible else { return }
+        guard isBarVisible else {
+            scheduleBarPanelReleaseIfNeeded()
+            return
+        }
         isBarVisible = false
         lastBarFrame = nil
-        barPanel.orderOut(nil)
+        barPanel?.orderOut(nil)
+        scheduleBarPanelReleaseIfNeeded()
     }
 
     private func barOrigin(for size: NSSize, windowRect: NSRect) -> NSPoint {
@@ -1123,6 +1220,7 @@ final class UnifiedEdgeBarController: NSObject {
     // MARK: - Content View Management
 
     private func rebuildContentView() {
+        let barPanel = ensureBarPanel()
         let size = isExpanded ? Self.expandedSize : Self.collapsedSize
         let frame = NSRect(origin: .zero, size: size)
         let content = UnifiedBarContentView(frame: frame, controller: self, model: model)
@@ -1135,7 +1233,7 @@ final class UnifiedEdgeBarController: NSObject {
     private func applyThemeIfNeeded() {
         guard renderedTheme != model.appTheme else { return }
         renderedTheme = model.appTheme
-        barPanel.appearance = model.appTheme.nsAppearance
+        barPanel?.appearance = model.appTheme.nsAppearance
         rebuildContentView()
     }
 
@@ -1169,6 +1267,42 @@ final class UnifiedEdgeBarController: NSObject {
         )
         barContentView = panel.contentView as? UnifiedBarContentView
         return panel
+    }
+
+    private func ensureBarPanel() -> NSPanel {
+        if let barPanel {
+            return barPanel
+        }
+        let panel = makeBarPanel()
+        barPanel = panel
+        renderedTheme = model.appTheme
+        panel.appearance = model.appTheme.nsAppearance
+        return panel
+    }
+
+    private func scheduleBarPanelReleaseIfNeeded() {
+        guard barPanel != nil, !isBarVisible,
+              !isTranslatingInput, !isTranslatingResponse else { return }
+        panelReleaseTask?.cancel()
+        panelReleaseTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(30))
+            } catch {
+                return
+            }
+            self?.releaseBarPanel()
+        }
+    }
+
+    private func releaseBarPanel() {
+        guard !isBarVisible else { return }
+        panelReleaseTask?.cancel()
+        panelReleaseTask = nil
+        barContentView = nil
+        barPanel?.contentView = nil
+        barPanel?.close()
+        barPanel = nil
+        renderedTheme = nil
     }
 
     // MARK: - Window Rect Helpers

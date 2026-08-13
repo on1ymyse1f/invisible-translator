@@ -4,7 +4,6 @@ import CryptoKit
 import Foundation
 import NaturalLanguage
 import ScreenCaptureKit
-import Vision
 
 enum ResponseCaptureSource: String, Equatable, Sendable {
     case selectedText
@@ -161,11 +160,17 @@ struct GenericAccessibilityResponseAdapter: ResponseSourceAdapter {
 struct ResponseTranslationCache: Sendable {
     private let capacity: Int
     private let timeToLive: TimeInterval
+    private let maximumByteCount: Int
     private var entries: [(key: String, translation: String, expiresAt: Date)] = []
 
-    init(capacity: Int = 32, timeToLive: TimeInterval = 300) {
+    init(
+        capacity: Int = 16,
+        timeToLive: TimeInterval = 180,
+        maximumByteCount: Int = 1_048_576
+    ) {
         self.capacity = max(1, capacity)
         self.timeToLive = max(1, timeToLive)
+        self.maximumByteCount = max(0, maximumByteCount)
     }
 
     mutating func translation(for source: String, now: Date = Date()) -> String? {
@@ -216,10 +221,17 @@ struct ResponseTranslationCache: Sendable {
     private mutating func insert(_ translation: String, forKey key: String, now: Date) {
         removeExpiredEntries(now: now)
         entries.removeAll { $0.key == key }
-        entries.append((key: key, translation: translation, expiresAt: now.addingTimeInterval(timeToLive)))
-        if entries.count > capacity {
-            entries.removeFirst(entries.count - capacity)
+        guard translation.utf8.count <= maximumByteCount else {
+            return
         }
+        entries.append((key: key, translation: translation, expiresAt: now.addingTimeInterval(timeToLive)))
+        while entries.count > capacity || currentByteCount > maximumByteCount {
+            entries.removeFirst()
+        }
+    }
+
+    private var currentByteCount: Int {
+        entries.reduce(0) { $0 + $1.translation.utf8.count }
     }
 
     private static func key(for source: String) -> String {
@@ -326,8 +338,12 @@ struct AIResponseReader: Sendable {
     }
 
     private let maxDepth = 26
-    private let maxNodes = 4_000
+    private let maxNodes: Int
     private let maxCandidateLength = TranslationLimits.maxResponseCharacters
+
+    init(maximumNodeCount: Int = AIResponseScanBudget.initialNodeLimit) {
+        maxNodes = min(max(maximumNodeCount, 1), AIResponseScanBudget.initialNodeLimit)
+    }
 
     func latestForeignResponse(
         in app: NSRunningApplication,
@@ -354,7 +370,14 @@ struct AIResponseReader: Sendable {
 
         var nodeCount = 0
         var rawTexts: [String] = []
-        collectTexts(from: root, depth: 0, nodeCount: &nodeCount, into: &rawTexts)
+        collectTexts(
+            from: root,
+            depth: 0,
+            nodeCount: &nodeCount,
+            newestFirst: true,
+            into: &rawTexts
+        )
+        rawTexts.reverse()
         rawTexts = Self.removingExactInterfaceChrome(
             from: rawTexts,
             labels: [
@@ -530,12 +553,12 @@ struct AIResponseReader: Sendable {
                stringAttribute(kAXSubroleAttribute, from: element) == "AXSectionList",
                let directChildren = childrenAttribute(kAXChildrenAttribute, from: element) {
                 let messages = directChildren.compactMap { child -> String? in
-                    var childNodeCount = 0
+                    guard visited < maxNodes else { return nil }
                     var texts: [String] = []
                     collectTexts(
                         from: child,
                         depth: 0,
-                        nodeCount: &childNodeCount,
+                        nodeCount: &visited,
                         into: &texts
                     )
                     let candidates = Self.leafPreferredDeduplicated(
@@ -562,7 +585,7 @@ struct AIResponseReader: Sendable {
             guard let children = childrenAttribute(kAXChildrenAttribute, from: element) else {
                 return
             }
-            for child in children {
+            for child in children.reversed() {
                 visit(child, depth: depth + 1)
             }
         }
@@ -876,8 +899,12 @@ struct AIResponseReader: Sendable {
             let configuration = SCStreamConfiguration()
             let scale = max(CGFloat(filter.pointPixelScale), 1)
             configuration.sourceRect = capturePlan.sourceRect
-            configuration.width = max(Int(capturePlan.sourceRect.width * scale), 1)
-            configuration.height = max(Int(capturePlan.sourceRect.height * scale), 1)
+            let captureSize = VisionTextRecognitionProfile.replyOCR.configuration.fittedPixelSize(
+                width: max(Int(capturePlan.sourceRect.width * scale), 1),
+                height: max(Int(capturePlan.sourceRect.height * scale), 1)
+            )
+            configuration.width = captureSize.width
+            configuration.height = captureSize.height
             configuration.showsCursor = false
             image = try await SCScreenshotManager.captureImage(
                 contentFilter: filter,
@@ -894,106 +921,21 @@ struct AIResponseReader: Sendable {
         return overlap.isNull ? 0 : overlap.width * overlap.height
     }
 
-    private struct OCRLine {
-        let text: String
-        let confidence: Float
-        let boundingBox: CGRect
-    }
-
-    private struct OCRPass {
-        let lines: [OCRLine]
-
-        var averageConfidence: Float {
-            guard !lines.isEmpty else { return 0 }
-            return lines.reduce(0) { $0 + $1.confidence } / Float(lines.count)
-        }
-    }
-
     static func shouldRetryOCR(lineCount: Int, averageConfidence: Float) -> Bool {
         lineCount < 2 || averageConfidence < 0.72
     }
 
     private func recognizedTextLines(in image: CGImage) -> [String] {
-        let automaticPass = performOCR(in: image, recognitionLanguages: nil)
-        guard Self.shouldRetryOCR(
-            lineCount: automaticPass.lines.count,
-            averageConfidence: automaticPass.averageConfidence
-        ) else {
-            return automaticPass.lines.map(\.text)
-        }
-
-        let detectedLanguage = ResponseLanguageDetector.detectExplicitSelection(
-            in: automaticPass.lines.map(\.text).joined(separator: "\n")
-        )
-        let secondPass = performOCR(
-            in: image,
-            recognitionLanguages: preferredOCRLanguages(for: detectedLanguage)
-        )
-        let automaticScore = automaticPass.averageConfidence
-            + min(Float(automaticPass.lines.count), 12) * 0.012
-        let secondPassScore = secondPass.averageConfidence
-            + min(Float(secondPass.lines.count), 12) * 0.012
-        return (secondPassScore > automaticScore ? secondPass : automaticPass)
-            .lines
-            .map(\.text)
-    }
-
-    private func performOCR(
-        in image: CGImage,
-        recognitionLanguages: [String]?
-    ) -> OCRPass {
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate
-        request.usesLanguageCorrection = true
-        if let recognitionLanguages {
-            request.automaticallyDetectsLanguage = false
-            request.recognitionLanguages = recognitionLanguages
-        } else {
-            request.automaticallyDetectsLanguage = true
-        }
-
-        let handler = VNImageRequestHandler(cgImage: image, options: [:])
         do {
-            try handler.perform([request])
+            return try ScreenTextOCRRecognizer.recognize(
+                in: image,
+                profile: .replyOCR
+            )
+            .text
+            .components(separatedBy: .newlines)
+            .filter { !$0.isEmpty }
         } catch {
-            return OCRPass(lines: [])
-        }
-
-        let lines = (request.results ?? [])
-            .sorted { lhs, rhs in
-                if abs(lhs.boundingBox.midY - rhs.boundingBox.midY) > 0.015 {
-                    return lhs.boundingBox.maxY > rhs.boundingBox.maxY
-                }
-                return lhs.boundingBox.minX < rhs.boundingBox.minX
-            }
-            .compactMap { observation -> OCRLine? in
-                guard let candidate = observation.topCandidates(1).first else {
-                    return nil
-                }
-                let text = candidate.string.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !text.isEmpty else { return nil }
-                return OCRLine(
-                    text: text,
-                    confidence: candidate.confidence,
-                    boundingBox: observation.boundingBox
-                )
-            }
-        return OCRPass(lines: lines)
-    }
-
-    private func preferredOCRLanguages(for language: DetectedResponseLanguage?) -> [String] {
-        switch language?.identifier.lowercased() {
-        case "en": return ["en-US"]
-        case "ja": return ["ja-JP"]
-        case "ko": return ["ko-KR"]
-        case "fr": return ["fr-FR"]
-        case "de": return ["de-DE"]
-        case "es": return ["es-ES"]
-        case "it": return ["it-IT"]
-        case "pt": return ["pt-BR", "pt-PT"]
-        case "ru": return ["ru-RU"]
-        default:
-            return ["en-US", "ja-JP", "ko-KR", "fr-FR", "de-DE", "es-ES"]
+            return []
         }
     }
 
@@ -1062,6 +1004,7 @@ struct AIResponseReader: Sendable {
         from element: AXUIElement,
         depth: Int,
         nodeCount: inout Int,
+        newestFirst: Bool = false,
         into texts: inout [String]
     ) {
         guard depth <= maxDepth, nodeCount < maxNodes else {
@@ -1089,8 +1032,15 @@ struct AIResponseReader: Sendable {
             return
         }
 
-        for child in children {
-            collectTexts(from: child, depth: depth + 1, nodeCount: &nodeCount, into: &texts)
+        let orderedChildren: [AXUIElement] = newestFirst ? Array(children.reversed()) : children
+        for child in orderedChildren {
+            collectTexts(
+                from: child,
+                depth: depth + 1,
+                nodeCount: &nodeCount,
+                newestFirst: newestFirst,
+                into: &texts
+            )
         }
     }
 
@@ -1377,8 +1327,22 @@ struct AIResponseReader: Sendable {
     }
 }
 
+enum AIResponseScanBudget {
+    static let initialNodeLimit = 2_000
+    static let incrementalNodeLimit = 600
+
+    static func nodeLimit(
+        previousProcessIdentifier: pid_t?,
+        currentProcessIdentifier: pid_t
+    ) -> Int {
+        previousProcessIdentifier == currentProcessIdentifier
+            ? incrementalNodeLimit
+            : initialNodeLimit
+    }
+}
+
 actor AIResponseScanWorker {
-    private let reader = AIResponseReader()
+    private var lastScannedProcessIdentifier: pid_t?
 
     func latestForeignResponse(
         processIdentifier: pid_t,
@@ -1388,7 +1352,16 @@ actor AIResponseScanWorker {
             return nil
         }
 
-        return await reader.latestForeignResponse(in: app, allowOCR: allowOCR)
+        let nodeLimit = AIResponseScanBudget.nodeLimit(
+            previousProcessIdentifier: lastScannedProcessIdentifier,
+            currentProcessIdentifier: processIdentifier
+        )
+        lastScannedProcessIdentifier = processIdentifier
+        let interval = PerformanceSignpost.begin(.responseScan, units: nodeLimit)
+        let response = await AIResponseReader(maximumNodeCount: nodeLimit)
+            .latestForeignResponse(in: app, allowOCR: allowOCR)
+        PerformanceSignpost.end(interval, outcome: .succeeded, units: nodeLimit)
+        return response
     }
 
     func selectedForeignResponse(processIdentifier: pid_t) -> DetectedForeignResponse? {
@@ -1396,7 +1369,7 @@ actor AIResponseScanWorker {
             return nil
         }
 
-        return reader.selectedForeignResponse(in: app)
+        return AIResponseReader().selectedForeignResponse(in: app)
     }
 }
 

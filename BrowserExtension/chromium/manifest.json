@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "Invisible Translator Companion",
+  "version": "1.0.0",
+  "description": "A local companion for explicitly authorised bilingual translation.",
+  "minimum_chrome_version": "102",
+  "permissions": ["nativeMessaging"],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
+    "https://claude.ai/*",
+    "https://x.com/*",
+    "https://twitter.com/*",
+    "https://www.youtube.com/*",
+    "https://youtube.com/*"
+  ],
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*",
+        "https://claude.ai/*",
+        "https://x.com/*",
+        "https://twitter.com/*",
+        "https://www.youtube.com/*",
+        "https://youtube.com/*"
+      ],
+      "js": ["core.js", "content.js"],
+      "css": ["translation.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Invisible Translator Companion"
+  }
+}

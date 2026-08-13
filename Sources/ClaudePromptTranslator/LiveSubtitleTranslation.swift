@@ -81,6 +81,16 @@ struct SubtitleCueProcessor: Sendable {
     private(set) var pendingText = ""
     private(set) var pendingFrames = 0
     private(set) var lastEmittedText = ""
+    let stableSimilarityThreshold: Double
+    let duplicateSimilarityThreshold: Double
+
+    init(
+        stableSimilarityThreshold: Double = 0.92,
+        duplicateSimilarityThreshold: Double = 0.92
+    ) {
+        self.stableSimilarityThreshold = stableSimilarityThreshold
+        self.duplicateSimilarityThreshold = duplicateSimilarityThreshold
+    }
 
     mutating func observe(_ rawText: String) -> String? {
         guard let cue = SubtitleSentenceFormatter.normalizedCue(from: rawText) else {
@@ -89,36 +99,86 @@ struct SubtitleCueProcessor: Sendable {
             return nil
         }
 
-        if cue == pendingText {
+        if !pendingText.isEmpty,
+           SubtitleTextSimilarity.score(cue, pendingText) >= stableSimilarityThreshold {
             pendingFrames += 1
+            if cue.count >= pendingText.count {
+                pendingText = cue
+            }
         } else {
             pendingText = cue
             pendingFrames = 1
         }
 
         guard pendingFrames >= 2,
-              cue != lastEmittedText else {
+              lastEmittedText.isEmpty
+                || SubtitleTextSimilarity.score(pendingText, lastEmittedText)
+                    < duplicateSimilarityThreshold else {
             return nil
         }
-        lastEmittedText = cue
-        return cue
+        lastEmittedText = pendingText
+        return pendingText
     }
+}
+
+enum SubtitleTextSimilarity {
+    static func score(_ lhs: String, _ rhs: String) -> Double {
+        if lhs == rhs { return 1 }
+        let left = Array(lhs)
+        let right = Array(rhs)
+        guard !left.isEmpty, !right.isEmpty else { return 0 }
+
+        let maximumLength = max(left.count, right.count)
+        if abs(left.count - right.count) > Int(Double(maximumLength) * 0.25) {
+            return 1 - Double(abs(left.count - right.count)) / Double(maximumLength)
+        }
+
+        var previous = Array(0...right.count)
+        var current = Array(repeating: 0, count: right.count + 1)
+        for (leftIndex, leftCharacter) in left.enumerated() {
+            current[0] = leftIndex + 1
+            for (rightIndex, rightCharacter) in right.enumerated() {
+                let substitution = previous[rightIndex]
+                    + (leftCharacter == rightCharacter ? 0 : 1)
+                current[rightIndex + 1] = min(
+                    previous[rightIndex + 1] + 1,
+                    current[rightIndex] + 1,
+                    substitution
+                )
+            }
+            swap(&previous, &current)
+        }
+        return max(0, 1 - Double(previous[right.count]) / Double(maximumLength))
+    }
+}
+
+struct SubtitleTranslationCacheStatistics: Equatable, Sendable {
+    let entryCount: Int
+    let byteCount: Int
 }
 
 actor SubtitleTranslationCache {
     private struct Entry {
         let value: TranslationProviderOutput
         let expiresAt: Date
+        let byteCount: Int
     }
 
     private var values: [String: Entry] = [:]
     private var order: [String] = []
+    private var byteCount = 0
     private let capacity: Int
     private let timeToLive: TimeInterval
+    private let maximumBytes: Int
 
-    init(capacity: Int = 160, timeToLive: TimeInterval = 300) {
+    init(
+        capacity: Int = 64,
+        timeToLive: TimeInterval = 180,
+        maximumBytes: Int = 512 * 1_024
+    ) {
         self.capacity = max(capacity, 1)
         self.timeToLive = max(timeToLive, 1)
+        self.maximumBytes = max(maximumBytes, 1)
     }
 
     func value(
@@ -142,17 +202,39 @@ actor SubtitleTranslationCache {
     ) {
         removeExpiredEntries(now: now)
         let key = Self.cacheKey(text: text, target: target)
-        values[key] = Entry(value: value, expiresAt: now.addingTimeInterval(timeToLive))
+        if let previous = values.removeValue(forKey: key) {
+            byteCount -= previous.byteCount
+        }
         order.removeAll { $0 == key }
+
+        let entryByteCount = key.utf8.count
+            + value.text.utf8.count
+            + value.providerName.utf8.count
+        guard entryByteCount <= maximumBytes else { return }
+        values[key] = Entry(
+            value: value,
+            expiresAt: now.addingTimeInterval(timeToLive),
+            byteCount: entryByteCount
+        )
+        byteCount += entryByteCount
         order.append(key)
-        while order.count > capacity {
-            values.removeValue(forKey: order.removeFirst())
+        while order.count > capacity || byteCount > maximumBytes {
+            removeValue(forKey: order.removeFirst())
         }
     }
 
     func removeAll() {
         values.removeAll(keepingCapacity: false)
         order.removeAll(keepingCapacity: false)
+        byteCount = 0
+    }
+
+    func statistics(now: Date = Date()) -> SubtitleTranslationCacheStatistics {
+        removeExpiredEntries(now: now)
+        return SubtitleTranslationCacheStatistics(
+            entryCount: values.count,
+            byteCount: byteCount
+        )
     }
 
     nonisolated static func cacheKey(text: String, target: TargetLanguage) -> String {
@@ -169,9 +251,14 @@ actor SubtitleTranslationCache {
         guard !expired.isEmpty else { return }
         let expiredSet = Set(expired)
         for key in expiredSet {
-            values.removeValue(forKey: key)
+            removeValue(forKey: key)
         }
         order.removeAll { expiredSet.contains($0) }
+    }
+
+    private func removeValue(forKey key: String) {
+        guard let removed = values.removeValue(forKey: key) else { return }
+        byteCount -= removed.byteCount
     }
 }
 
@@ -229,6 +316,15 @@ final class SubtitleOverlayController {
 
     func hide() {
         panel?.orderOut(nil)
+        region = nil
+    }
+
+    func releaseResources() {
+        panel?.orderOut(nil)
+        panel?.contentView = nil
+        panel?.close()
+        panel = nil
+        hostingView = nil
         region = nil
     }
 

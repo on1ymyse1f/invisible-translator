@@ -1,6 +1,6 @@
 import Foundation
 
-enum TargetLanguage: String, CaseIterable, Identifiable {
+enum TargetLanguage: String, CaseIterable, Identifiable, Sendable {
     case simplifiedChinese = "zh-CN"
     case english = "en"
     case japanese = "ja"

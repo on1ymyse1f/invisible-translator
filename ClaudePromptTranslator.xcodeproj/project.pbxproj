@@ -35,6 +35,20 @@
 		100000000000000000000120 /* LiveSubtitleTranslation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000220 /* LiveSubtitleTranslation.swift */; };
 		100000000000000000000121 /* PrivacyAndContentPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000221 /* PrivacyAndContentPolicy.swift */; };
 		100000000000000000000122 /* TranslationPreferenceLearning.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000222 /* TranslationPreferenceLearning.swift */; };
+		100000000000000000000123 /* ASRModelStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000223 /* ASRModelStore.swift */; };
+		100000000000000000000124 /* LiveSubtitlePipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000224 /* LiveSubtitlePipeline.swift */; };
+		100000000000000000000125 /* RuntimeLifecycle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000225 /* RuntimeLifecycle.swift */; };
+		100000000000000000000126 /* SpeechRecognitionRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000226 /* SpeechRecognitionRuntime.swift */; };
+		100000000000000000000127 /* StoragePerformanceController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000227 /* StoragePerformanceController.swift */; };
+		100000000000000000000128 /* TranslationWorkBroker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000228 /* TranslationWorkBroker.swift */; };
+		100000000000000000000129 /* UpdateCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000229 /* UpdateCoordinator.swift */; };
+		10000000000000000000012A /* ASRModelStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000022A /* ASRModelStoreTests.swift */; };
+		10000000000000000000012B /* LiveSubtitlePipelineTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000022B /* LiveSubtitlePipelineTests.swift */; };
+		10000000000000000000012C /* RuntimeLifecycleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000022C /* RuntimeLifecycleTests.swift */; };
+		10000000000000000000012D /* SpeechRecognitionRuntimeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000022D /* SpeechRecognitionRuntimeTests.swift */; };
+		10000000000000000000012E /* StoragePerformanceControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000022E /* StoragePerformanceControllerTests.swift */; };
+		10000000000000000000012F /* TranslationWorkBrokerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000022F /* TranslationWorkBrokerTests.swift */; };
+		100000000000000000000130 /* UpdateCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000230 /* UpdateCoordinatorTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -79,6 +93,20 @@
 		100000000000000000000220 /* LiveSubtitleTranslation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveSubtitleTranslation.swift; sourceTree = "<group>"; };
 		100000000000000000000221 /* PrivacyAndContentPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivacyAndContentPolicy.swift; sourceTree = "<group>"; };
 		100000000000000000000222 /* TranslationPreferenceLearning.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranslationPreferenceLearning.swift; sourceTree = "<group>"; };
+		100000000000000000000223 /* ASRModelStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ASRModelStore.swift; sourceTree = "<group>"; };
+		100000000000000000000224 /* LiveSubtitlePipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveSubtitlePipeline.swift; sourceTree = "<group>"; };
+		100000000000000000000225 /* RuntimeLifecycle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RuntimeLifecycle.swift; sourceTree = "<group>"; };
+		100000000000000000000226 /* SpeechRecognitionRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechRecognitionRuntime.swift; sourceTree = "<group>"; };
+		100000000000000000000227 /* StoragePerformanceController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StoragePerformanceController.swift; sourceTree = "<group>"; };
+		100000000000000000000228 /* TranslationWorkBroker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranslationWorkBroker.swift; sourceTree = "<group>"; };
+		100000000000000000000229 /* UpdateCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateCoordinator.swift; sourceTree = "<group>"; };
+		10000000000000000000022A /* ASRModelStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ASRModelStoreTests.swift; sourceTree = "<group>"; };
+		10000000000000000000022B /* LiveSubtitlePipelineTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveSubtitlePipelineTests.swift; sourceTree = "<group>"; };
+		10000000000000000000022C /* RuntimeLifecycleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RuntimeLifecycleTests.swift; sourceTree = "<group>"; };
+		10000000000000000000022D /* SpeechRecognitionRuntimeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechRecognitionRuntimeTests.swift; sourceTree = "<group>"; };
+		10000000000000000000022E /* StoragePerformanceControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StoragePerformanceControllerTests.swift; sourceTree = "<group>"; };
+		10000000000000000000022F /* TranslationWorkBrokerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranslationWorkBrokerTests.swift; sourceTree = "<group>"; };
+		100000000000000000000230 /* UpdateCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateCoordinatorTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -135,6 +163,7 @@
 			children = (
 				100000000000000000000201 /* AppDelegate.swift */,
 				100000000000000000000202 /* AppModel.swift */,
+				100000000000000000000223 /* ASRModelStore.swift */,
 					10000000000000000000021C /* AppleTranslationCoordinator.swift */,
 				100000000000000000000203 /* AppTheme.swift */,
 					100000000000000000000212 /* AIResponseReader.swift */,
@@ -143,15 +172,21 @@
 					10000000000000000000021E /* HoverTranslation.swift */,
 					100000000000000000000206 /* InputTarget.swift */,
 					100000000000000000000220 /* LiveSubtitleTranslation.swift */,
+					100000000000000000000224 /* LiveSubtitlePipeline.swift */,
 					100000000000000000000207 /* PromptPanelController.swift */,
 					100000000000000000000221 /* PrivacyAndContentPolicy.swift */,
 					100000000000000000000208 /* PromptTextView.swift */,
 					100000000000000000000209 /* PromptView.swift */,
+					100000000000000000000225 /* RuntimeLifecycle.swift */,
 					10000000000000000000020A /* SelfTestRunner.swift */,
+					100000000000000000000226 /* SpeechRecognitionRuntime.swift */,
+					100000000000000000000227 /* StoragePerformanceController.swift */,
 					10000000000000000000020B /* TargetLanguage.swift */,
 					10000000000000000000020C /* TextDeliveryService.swift */,
 					10000000000000000000020D /* TranslationClient.swift */,
 					100000000000000000000222 /* TranslationPreferenceLearning.swift */,
+					100000000000000000000228 /* TranslationWorkBroker.swift */,
+					100000000000000000000229 /* UpdateCoordinator.swift */,
 					10000000000000000000021F /* ScreenTextOCR.swift */,
 					10000000000000000000021B /* SelectionOverlayController.swift */,
 					100000000000000000000219 /* UniversalSelection.swift */,
@@ -200,6 +235,13 @@
 			isa = PBXGroup;
 			children = (
 				100000000000000000000217 /* TranslationClientTests.swift */,
+				10000000000000000000022A /* ASRModelStoreTests.swift */,
+				10000000000000000000022B /* LiveSubtitlePipelineTests.swift */,
+				10000000000000000000022C /* RuntimeLifecycleTests.swift */,
+				10000000000000000000022D /* SpeechRecognitionRuntimeTests.swift */,
+				10000000000000000000022E /* StoragePerformanceControllerTests.swift */,
+				10000000000000000000022F /* TranslationWorkBrokerTests.swift */,
+				100000000000000000000230 /* UpdateCoordinatorTests.swift */,
 			);
 			path = ClaudePromptTranslatorTests;
 			sourceTree = "<group>";
@@ -309,6 +351,13 @@
 					100000000000000000000120 /* LiveSubtitleTranslation.swift in Sources */,
 					100000000000000000000121 /* PrivacyAndContentPolicy.swift in Sources */,
 					100000000000000000000122 /* TranslationPreferenceLearning.swift in Sources */,
+					100000000000000000000123 /* ASRModelStore.swift in Sources */,
+					100000000000000000000124 /* LiveSubtitlePipeline.swift in Sources */,
+					100000000000000000000125 /* RuntimeLifecycle.swift in Sources */,
+					100000000000000000000126 /* SpeechRecognitionRuntime.swift in Sources */,
+					100000000000000000000127 /* StoragePerformanceController.swift in Sources */,
+					100000000000000000000128 /* TranslationWorkBroker.swift in Sources */,
+					100000000000000000000129 /* UpdateCoordinator.swift in Sources */,
 				);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -317,6 +366,13 @@
 			buildActionMask = 2147483647;
 			files = (
 				100000000000000000000115 /* TranslationClientTests.swift in Sources */,
+				10000000000000000000012A /* ASRModelStoreTests.swift in Sources */,
+				10000000000000000000012B /* LiveSubtitlePipelineTests.swift in Sources */,
+				10000000000000000000012C /* RuntimeLifecycleTests.swift in Sources */,
+				10000000000000000000012D /* SpeechRecognitionRuntimeTests.swift in Sources */,
+				10000000000000000000012E /* StoragePerformanceControllerTests.swift in Sources */,
+				10000000000000000000012F /* TranslationWorkBrokerTests.swift in Sources */,
+				100000000000000000000130 /* UpdateCoordinatorTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -464,7 +520,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.7.0;
+				MARKETING_VERSION = 0.8.0;
 				PRODUCT_BUNDLE_IDENTIFIER = local.codex.ClaudePromptTranslator;
 				PRODUCT_MODULE_NAME = ClaudePromptTranslator;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -491,7 +547,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.7.0;
+				MARKETING_VERSION = 0.8.0;
 				PRODUCT_BUNDLE_IDENTIFIER = local.codex.ClaudePromptTranslator;
 				PRODUCT_MODULE_NAME = ClaudePromptTranslator;
 				PRODUCT_NAME = "$(TARGET_NAME)";

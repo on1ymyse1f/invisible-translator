@@ -86,6 +86,16 @@ final class SelectionOverlayController {
         removeOutsideClickMonitor()
     }
 
+    func releaseResources() {
+        removeOutsideClickMonitor()
+        panel?.orderOut(nil)
+        panel?.contentView = nil
+        panel?.close()
+        panel = nil
+        hostingView = nil
+        lastAnchorRect = nil
+    }
+
     private func installOutsideClickMonitorIfNeeded() {
         guard outsideClickMonitor == nil else {
             return

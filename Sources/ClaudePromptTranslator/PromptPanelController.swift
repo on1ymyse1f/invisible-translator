@@ -46,6 +46,13 @@ final class PromptPanelController {
         panel.orderOut(nil)
     }
 
+    func releaseResources() {
+        lastRequestedFrame = nil
+        panel.orderOut(nil)
+        panel.contentViewController = nil
+        panel.close()
+    }
+
     func bringToFront() {
         NSApp.activate()
         panel.makeKeyAndOrderFront(nil)

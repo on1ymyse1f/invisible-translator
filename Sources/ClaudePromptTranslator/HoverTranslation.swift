@@ -74,13 +74,125 @@ enum HoverTextSnippet {
     }
 }
 
+enum HoverEventDeliveryPolicy {
+    static let maximumDeliveriesPerSecond: Double = 10
+
+    static func nextDelay(
+        lastDeliveryUptime: TimeInterval,
+        currentUptime: TimeInterval,
+        maximumDeliveriesPerSecond: Double = maximumDeliveriesPerSecond
+    ) -> TimeInterval {
+        let boundedRate = max(1, maximumDeliveriesPerSecond)
+        let minimumInterval = 1 / boundedRate
+        guard lastDeliveryUptime.isFinite else { return 0 }
+        return max(0, minimumInterval - max(0, currentUptime - lastDeliveryUptime))
+    }
+}
+
+/// Coalesces raw mouse movement off the main actor and always delivers the most
+/// recent point. At most one trailing main-queue work item is pending.
+final class HoverEventCoalescer: @unchecked Sendable {
+    typealias Delivery = @MainActor @Sendable (CGPoint) -> Void
+
+    private let lock = NSLock()
+    private let maximumDeliveriesPerSecond: Double
+    private var lastDeliveryUptime = -TimeInterval.infinity
+    private var pendingPoint: CGPoint?
+    private var pendingWorkItem: DispatchWorkItem?
+    private var generation: UInt64 = 0
+    private var acceptsEvents = true
+
+    init(maximumDeliveriesPerSecond: Double = HoverEventDeliveryPolicy.maximumDeliveriesPerSecond) {
+        self.maximumDeliveriesPerSecond = max(1, maximumDeliveriesPerSecond)
+    }
+
+    func submit(
+        _ point: CGPoint,
+        currentUptime: TimeInterval = ProcessInfo.processInfo.systemUptime,
+        deliver: @escaping Delivery
+    ) {
+        lock.lock()
+        guard acceptsEvents else {
+            lock.unlock()
+            return
+        }
+        pendingPoint = point
+        guard pendingWorkItem == nil else {
+            lock.unlock()
+            return
+        }
+
+        let delay = HoverEventDeliveryPolicy.nextDelay(
+            lastDeliveryUptime: lastDeliveryUptime,
+            currentUptime: currentUptime,
+            maximumDeliveriesPerSecond: maximumDeliveriesPerSecond
+        )
+        generation &+= 1
+        let ticket = generation
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  let latestPoint = self.takePendingPoint(ticket: ticket) else {
+                return
+            }
+            MainActor.assumeIsolated {
+                deliver(latestPoint)
+            }
+        }
+        pendingWorkItem = workItem
+        lock.unlock()
+
+        if delay == 0 {
+            DispatchQueue.main.async(execute: workItem)
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        acceptsEvents = false
+        generation &+= 1
+        pendingWorkItem?.cancel()
+        pendingWorkItem = nil
+        pendingPoint = nil
+        lastDeliveryUptime = -.infinity
+        lock.unlock()
+    }
+
+    func resume() {
+        lock.lock()
+        acceptsEvents = true
+        generation &+= 1
+        pendingWorkItem?.cancel()
+        pendingWorkItem = nil
+        pendingPoint = nil
+        lastDeliveryUptime = -.infinity
+        lock.unlock()
+    }
+
+    private func takePendingPoint(ticket: UInt64) -> CGPoint? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard generation == ticket,
+              pendingWorkItem?.isCancelled == false,
+              let pendingPoint else {
+            return nil
+        }
+        self.pendingPoint = nil
+        pendingWorkItem = nil
+        lastDeliveryUptime = ProcessInfo.processInfo.systemUptime
+        return pendingPoint
+    }
+}
+
 @MainActor
 final class HoverTranslationMonitor {
     typealias Handler = @MainActor (NSRunningApplication, CGPoint) -> Void
 
     private let handler: Handler
     private var eventMonitor: Any?
-    private var dwellTask: Task<Void, Never>?
+    private let eventCoalescer = HoverEventCoalescer()
+    private let dwellSlot = TaskSlot<CGPoint>()
     private var lastQuartzPoint: CGPoint?
 
     init(handler: @escaping Handler) {
@@ -91,17 +203,19 @@ final class HoverTranslationMonitor {
 
     func start() {
         guard eventMonitor == nil else { return }
+        let eventCoalescer = self.eventCoalescer
+        eventCoalescer.resume()
         eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved]) { [weak self] event in
             guard let quartzPoint = event.cgEvent?.location else { return }
-            DispatchQueue.main.async { [weak self] in
+            eventCoalescer.submit(quartzPoint) { [weak self] quartzPoint in
                 self?.scheduleInspection(at: quartzPoint)
             }
         }
     }
 
     func stop() {
-        dwellTask?.cancel()
-        dwellTask = nil
+        eventCoalescer.cancel()
+        dwellSlot.cancel()
         lastQuartzPoint = nil
         if let eventMonitor {
             NSEvent.removeMonitor(eventMonitor)
@@ -115,17 +229,17 @@ final class HoverTranslationMonitor {
             return
         }
         lastQuartzPoint = point
-        dwellTask?.cancel()
-        dwellTask = Task { [weak self] in
+        dwellSlot.replace(operation: {
             try? await Task.sleep(nanoseconds: 650_000_000)
-            guard !Task.isCancelled,
-                  let self,
+            return point
+        }, deliver: { [weak self] deliveredPoint in
+            guard let self,
                   let app = NSWorkspace.shared.frontmostApplication,
                   app.processIdentifier != ProcessInfo.processInfo.processIdentifier else {
                 return
             }
-            handler(app, point)
-        }
+            handler(app, deliveredPoint)
+        })
     }
 }
 

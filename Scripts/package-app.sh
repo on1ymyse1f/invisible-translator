@@ -6,14 +6,21 @@ APP_NAME="ClaudePromptTranslator"
 INSTALL_APP_DIR="${INSTALL_APP_DIR:-${HOME}/Applications/${APP_NAME}.app}"
 DIST_DIR="${ROOT_DIR}/dist"
 DIST_ZIP_PATH="${DIST_DIR}/${APP_NAME}.app.zip"
-LEGACY_DIST_APP_DIR="${DIST_DIR}/${APP_NAME}.app"
+DIST_MANIFEST_PATH="${DIST_DIR}/${APP_NAME}.app.manifest.json"
+LOCAL_DIST_DIR="${DIST_DIR}/local-test"
+LOCAL_ZIP_PATH="${LOCAL_DIST_DIR}/${APP_NAME}.UNNOTARIZED.app.zip"
+LOCAL_MANIFEST_PATH="${LOCAL_DIST_DIR}/${APP_NAME}.UNNOTARIZED.app.manifest.json"
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${ROOT_DIR}/Packaging/Info.plist")"
-DIST_DMG_PATH="${DIST_DIR}/${APP_NAME}-${VERSION}.dmg"
-EXECUTABLE_PATH="${ROOT_DIR}/.build/release/${APP_NAME}"
 STAGING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/${APP_NAME}.XXXXXX")"
+RELEASE_SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/${APP_NAME}-release-build.XXXXXX")"
+RELEASE_DERIVED_DATA="${RELEASE_SCRATCH}/DerivedData"
 APP_DIR="${STAGING_DIR}/${APP_NAME}.app"
 VERIFY_SCRIPT="${ROOT_DIR}/Scripts/verify-release-app.sh"
+AUDIT_SCRIPT="${ROOT_DIR}/Scripts/audit-artifact.sh"
+MANIFEST_SCRIPT="${ROOT_DIR}/Scripts/write-release-manifest.sh"
 NOTARY_PROFILE="${NOTARY_PROFILE:-}"
+ARTIFACT_TIER="${ARTIFACT_TIER:-core}"
+PRIVATE_DSYM_ROOT="${PRIVATE_DSYM_ROOT:-${HOME}/Library/Application Support/ClaudePromptTranslator/PrivateDSYM}"
 EXPECTED_BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "${ROOT_DIR}/Packaging/Info.plist")"
 INSTALL_SWAP_DIR=""
 WAS_INSTALLED_APP_RUNNING=0
@@ -139,14 +146,41 @@ exit(1)
 
 cleanup() {
   rm -rf "${STAGING_DIR}"
+  rm -rf "${RELEASE_SCRATCH}"
   if [[ -n "${INSTALL_SWAP_DIR}" && -d "${INSTALL_SWAP_DIR}" \
         && "$(basename "${INSTALL_SWAP_DIR}")" == ".${APP_NAME}.install."* ]]; then
-    rm -rf -- "${INSTALL_SWAP_DIR}"
+    # Never let an interrupted installer permanently delete the user's prior
+    # app. Restore it if the destination is absent; otherwise move recoverable
+    # app bundles to Trash and remove the empty transaction directory only.
+    if [[ -d "${INSTALL_SWAP_DIR}/previous-${APP_NAME}.app" \
+          && ! -e "${INSTALL_APP_DIR}" ]]; then
+      mv "${INSTALL_SWAP_DIR}/previous-${APP_NAME}.app" "${INSTALL_APP_DIR}" || true
+    fi
+    for recoverable_app in \
+      "${INSTALL_SWAP_DIR}/previous-${APP_NAME}.app" \
+      "${INSTALL_SWAP_DIR}/failed-${APP_NAME}.app"; do
+      if [[ -d "${recoverable_app}" ]]; then
+        /usr/bin/trash "${recoverable_app}" || true
+      fi
+    done
+    if [[ -d "${INSTALL_SWAP_DIR}/${APP_NAME}.app" ]]; then
+      rm -rf -- "${INSTALL_SWAP_DIR}/${APP_NAME}.app"
+    fi
+    rmdir "${INSTALL_SWAP_DIR}" 2>/dev/null || \
+      echo "Installer recovery directory retained: ${INSTALL_SWAP_DIR}" >&2
   fi
 }
 trap cleanup EXIT
 
 validate_install_destination "${INSTALL_APP_DIR}"
+
+# The optional 0.9 runtime pulls dynamic frameworks and resources. Until the
+# packaging path embeds and signs each nested component explicitly, fail closed
+# instead of silently emitting an incomplete app that happens to compile.
+if [[ "${CPT_INCLUDE_OPTIONAL_RUNTIME:-0}" == "1" ]]; then
+  echo "Refusing to package CPT_INCLUDE_OPTIONAL_RUNTIME=1: optional framework/resource embedding is not implemented yet." >&2
+  exit 2
+fi
 
 cd "${ROOT_DIR}"
 
@@ -155,7 +189,28 @@ if [[ -z "${DEVELOPER_DIR:-}" && -d "/Applications/Xcode.app/Contents/Developer"
 fi
 
 "${ROOT_DIR}/Scripts/test.sh"
-swift build -c release
+# A release must not rebuild the checkout's .build cache. The temporary
+# scratch/DerivedData directories are removed after the signed artifact has
+# been verified. SwiftPM uses --scratch-path; its Clang module cache is also
+# explicitly contained for toolchains that invoke Clang while linking.
+mkdir -p "${RELEASE_DERIVED_DATA}/ModuleCache.noindex"
+export CLANG_MODULE_CACHE_PATH="${RELEASE_DERIVED_DATA}/ModuleCache.noindex"
+swift build \
+  --package-path "${ROOT_DIR}" \
+  --scratch-path "${RELEASE_SCRATCH}" \
+  -c release \
+  -Xswiftc -g
+RELEASE_BIN_DIR="$(swift build \
+  --package-path "${ROOT_DIR}" \
+  --scratch-path "${RELEASE_SCRATCH}" \
+  -c release \
+  -Xswiftc -g \
+  --show-bin-path)"
+EXECUTABLE_PATH="${RELEASE_BIN_DIR}/${APP_NAME}"
+if [[ ! -x "${EXECUTABLE_PATH}" ]]; then
+  echo "Release executable was not produced: ${EXECUTABLE_PATH}" >&2
+  exit 1
+fi
 
 # Privacy regression guard: no debug-only process control or diagnostics entry
 # point may enter production.
@@ -187,6 +242,29 @@ cp "${ROOT_DIR}/Packaging/Info.plist" "${APP_DIR}/Contents/Info.plist"
 cp "${ROOT_DIR}/Resources/AppIcon.icns" "${APP_DIR}/Contents/Resources/AppIcon.icns"
 chmod +x "${APP_DIR}/Contents/MacOS/${APP_NAME}"
 xattr -cr "${APP_DIR}" 2>/dev/null || true
+
+# Archive symbols before stripping. The dSYM never enters the app, ZIP or
+# repository. A timestamped directory prevents a later local build from
+# replacing symbols needed to inspect an earlier crash report.
+GIT_SHA="$(git -C "${ROOT_DIR}" rev-parse HEAD)"
+DSYM_TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+DSYM_STAGE="${STAGING_DIR}/${APP_NAME}.app.dSYM"
+PRIVATE_DSYM_PATH="${PRIVATE_DSYM_ROOT}/${VERSION}-${GIT_SHA}-${DSYM_TIMESTAMP}/${APP_NAME}.app.dSYM"
+mkdir -p "$(dirname "${PRIVATE_DSYM_PATH}")"
+xcrun dsymutil "${EXECUTABLE_PATH}" -o "${DSYM_STAGE}"
+ditto --norsrc --noextattr --noacl --noqtn "${DSYM_STAGE}" "${PRIVATE_DSYM_PATH}"
+
+# Do not strip a signed Mach-O: it would invalidate the signature and risks
+# accidentally publishing a bundle whose signature no longer represents its
+# contents. SwiftPM output is intentionally unsigned; the staged copy is
+# stripped before the first signing operation below.
+STAGED_BINARY="${APP_DIR}/Contents/MacOS/${APP_NAME}"
+if codesign --verify --strict "${STAGED_BINARY}" >/dev/null 2>&1; then
+  echo "Refusing to strip an already signed staged executable." >&2
+  exit 1
+fi
+xcrun strip -S -x "${STAGED_BINARY}"
+"${AUDIT_SCRIPT}" --tier "${ARTIFACT_TIER}" "${APP_DIR}"
 
 SIGN_IDENTITY="$(
   security find-identity -p codesigning -v 2>/dev/null \
@@ -259,15 +337,35 @@ if ! relaunch_installed_app_if_needed; then
 fi
 
 if [[ -d "${PREVIOUS_INSTALL_APP}" ]]; then
-  rm -rf -- "${PREVIOUS_INSTALL_APP}"
+  /usr/bin/trash "${PREVIOUS_INSTALL_APP}"
+  echo "Moved the previous installed app to Trash for recoverable rollback."
 fi
 rmdir "${INSTALL_SWAP_DIR}"
 INSTALL_SWAP_DIR=""
 
 mkdir -p "${DIST_DIR}"
-rm -rf "${LEGACY_DIST_APP_DIR}"
-rm -f "${DIST_ZIP_PATH}"
-rm -f "${DIST_DMG_PATH}"
+
+# Always create a clearly labelled local-test archive so size/integrity gates
+# can be exercised without Developer ID or notary credentials. This archive is
+# never presented as a public release.
+LOCAL_STAGE_DIR="${STAGING_DIR}/local-dist-stage"
+LOCAL_STAGE_APP="${LOCAL_STAGE_DIR}/${APP_NAME}.app"
+LOCAL_FINAL_ZIP="${STAGING_DIR}/${APP_NAME}.UNNOTARIZED.app.zip"
+LOCAL_FINAL_MANIFEST="${STAGING_DIR}/${APP_NAME}.UNNOTARIZED.app.manifest.json"
+mkdir -p "${LOCAL_STAGE_DIR}" "${LOCAL_DIST_DIR}"
+ditto --norsrc --noextattr --noacl --noqtn "${INSTALL_APP_DIR}" "${LOCAL_STAGE_APP}"
+ditto -c -k --keepParent --norsrc --noextattr --noacl --noqtn \
+  "${LOCAL_STAGE_APP}" \
+  "${LOCAL_FINAL_ZIP}"
+"${AUDIT_SCRIPT}" --tier "${ARTIFACT_TIER}" "${LOCAL_STAGE_APP}" "${LOCAL_FINAL_ZIP}"
+"${MANIFEST_SCRIPT}" \
+  "${LOCAL_STAGE_APP}" \
+  "${LOCAL_FINAL_ZIP}" \
+  "${LOCAL_FINAL_MANIFEST}" \
+  local-test-unnotarized
+mv -f "${LOCAL_FINAL_ZIP}" "${LOCAL_ZIP_PATH}"
+mv -f "${LOCAL_FINAL_MANIFEST}" "${LOCAL_MANIFEST_PATH}"
+echo "Created local-test artifact ${LOCAL_ZIP_PATH} (not notarized; not for public distribution)."
 
 if [[ "${SIGN_IDENTITY}" != Developer\ ID\ Application:* || -z "${NOTARY_PROFILE}" ]]; then
   if [[ "${SIGN_IDENTITY}" != Developer\ ID\ Application:* ]]; then
@@ -275,6 +373,7 @@ if [[ "${SIGN_IDENTITY}" != Developer\ ID\ Application:* || -z "${NOTARY_PROFILE
   else
     echo "Skipped public ZIP: NOTARY_PROFILE is unavailable."
   fi
+  echo "Existing dist artifacts were left untouched; they are not evidence that this local build is public-release ready."
   echo "Installed local-test app ${INSTALL_APP_DIR}"
   echo "Run: open \"${INSTALL_APP_DIR}\""
   exit 0
@@ -297,13 +396,11 @@ xcrun notarytool submit "${NOTARY_SUBMISSION_ZIP}" \
   --keychain-profile "${NOTARY_PROFILE}" \
   --wait
 xcrun stapler staple "${DIST_STAGE_APP}"
-xcrun stapler validate "${DIST_STAGE_APP}"
-spctl --assess --type execute --verbose=4 "${DIST_STAGE_APP}"
+"${VERIFY_SCRIPT}" --public --require-gatekeeper "${DIST_STAGE_APP}"
 
 # Keep the locally installed Developer ID build equivalent to the public ZIP.
 xcrun stapler staple "${INSTALL_APP_DIR}"
-xcrun stapler validate "${INSTALL_APP_DIR}"
-spctl --assess --type execute --verbose=4 "${INSTALL_APP_DIR}"
+"${VERIFY_SCRIPT}" --public --require-gatekeeper "${INSTALL_APP_DIR}"
 
 FINAL_ZIP_PATH="${STAGING_DIR}/${APP_NAME}.app.zip"
 ditto -c -k --keepParent --norsrc --noextattr --noacl --noqtn \
@@ -313,9 +410,7 @@ ditto -c -k --keepParent --norsrc --noextattr --noacl --noqtn \
 DIST_VERIFY_DIR="${STAGING_DIR}/dist-zip-verify"
 mkdir -p "${DIST_VERIFY_DIR}"
 ditto -x -k "${FINAL_ZIP_PATH}" "${DIST_VERIFY_DIR}"
-"${VERIFY_SCRIPT}" --public "${DIST_VERIFY_DIR}/${APP_NAME}.app"
-xcrun stapler validate "${DIST_VERIFY_DIR}/${APP_NAME}.app"
-spctl --assess --type execute --verbose=4 "${DIST_VERIFY_DIR}/${APP_NAME}.app"
+"${VERIFY_SCRIPT}" --public --require-gatekeeper "${DIST_VERIFY_DIR}/${APP_NAME}.app"
 
 INSTALL_SHA="$(shasum -a 256 "${INSTALL_APP_DIR}/Contents/MacOS/${APP_NAME}" | awk '{print $1}')"
 ARCHIVE_SHA="$(shasum -a 256 "${DIST_VERIFY_DIR}/${APP_NAME}.app/Contents/MacOS/${APP_NAME}" | awk '{print $1}')"
@@ -324,9 +419,20 @@ if [[ "${INSTALL_SHA}" != "${ARCHIVE_SHA}" ]]; then
   exit 1
 fi
 
+"${AUDIT_SCRIPT}" --tier "${ARTIFACT_TIER}" "${DIST_VERIFY_DIR}/${APP_NAME}.app" "${FINAL_ZIP_PATH}"
+FINAL_MANIFEST_PATH="${STAGING_DIR}/${APP_NAME}.app.manifest.json"
+"${MANIFEST_SCRIPT}" \
+  "${DIST_VERIFY_DIR}/${APP_NAME}.app" \
+  "${FINAL_ZIP_PATH}" \
+  "${FINAL_MANIFEST_PATH}" \
+  public-notarized
+
 # Only a fully notarized, stapled, Gatekeeper-accepted archive reaches dist.
 mv -f "${FINAL_ZIP_PATH}" "${DIST_ZIP_PATH}"
+mv -f "${FINAL_MANIFEST_PATH}" "${DIST_MANIFEST_PATH}"
 
 echo "Installed ${INSTALL_APP_DIR}"
 echo "Created notarized and stapled public artifact ${DIST_ZIP_PATH}"
+echo "Created release manifest ${DIST_MANIFEST_PATH}"
+echo "Private dSYM archived at ${PRIVATE_DSYM_PATH}"
 echo "Run: open \"${INSTALL_APP_DIR}\""

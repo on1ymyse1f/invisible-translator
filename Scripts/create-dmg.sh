@@ -111,8 +111,7 @@ if [[ ! -d "${SOURCE_APP_PATH}" ]]; then
 fi
 
 "${VERIFY_SCRIPT}" --public "${SOURCE_APP_PATH}"
-xcrun stapler validate "${SOURCE_APP_PATH}"
-spctl --assess --type execute --verbose=4 "${SOURCE_APP_PATH}"
+"${VERIFY_SCRIPT}" --public --require-gatekeeper "${SOURCE_APP_PATH}"
 
 DEVELOPER_ID_IDENTITY="$(
   codesign -d --verbose=4 "${SOURCE_APP_PATH}" 2>&1 \
@@ -130,14 +129,12 @@ mkdir -p "$(dirname "${STAGED_SOURCE_APP}")"
 ditto --norsrc --noextattr --noacl --noqtn "${SOURCE_APP_PATH}" "${STAGED_SOURCE_APP}"
 xattr -cr "${STAGED_SOURCE_APP}" 2>/dev/null || true
 "${VERIFY_SCRIPT}" --public "${STAGED_SOURCE_APP}"
-xcrun stapler validate "${STAGED_SOURCE_APP}"
-spctl --assess --type execute --verbose=4 "${STAGED_SOURCE_APP}"
+"${VERIFY_SCRIPT}" --public --require-gatekeeper "${STAGED_SOURCE_APP}"
 
 ditto --norsrc --noextattr --noacl --noqtn "${STAGED_SOURCE_APP}" "${DMG_ROOT}/${APP_NAME}.app"
 ln -s /Applications "${DMG_ROOT}/Applications"
 "${VERIFY_SCRIPT}" --public "${DMG_ROOT}/${APP_NAME}.app"
-xcrun stapler validate "${DMG_ROOT}/${APP_NAME}.app"
-spctl --assess --type execute --verbose=4 "${DMG_ROOT}/${APP_NAME}.app"
+"${VERIFY_SCRIPT}" --public --require-gatekeeper "${DMG_ROOT}/${APP_NAME}.app"
 
 mkdir -p "${DIST_DIR}"
 if diskutil image create from --help >/dev/null 2>&1; then
@@ -169,8 +166,7 @@ mkdir -p "${MOUNT_DIR}"
 hdiutil attach -readonly -nobrowse -mountpoint "${MOUNT_DIR}" "${WORK_DMG_PATH}" >/dev/null
 MOUNTED=1
 "${VERIFY_SCRIPT}" --public "${MOUNT_DIR}/${APP_NAME}.app"
-xcrun stapler validate "${MOUNT_DIR}/${APP_NAME}.app"
-spctl --assess --type execute --verbose=4 "${MOUNT_DIR}/${APP_NAME}.app"
+"${VERIFY_SCRIPT}" --public --require-gatekeeper "${MOUNT_DIR}/${APP_NAME}.app"
 hdiutil detach "${MOUNT_DIR}" >/dev/null
 MOUNTED=0
 

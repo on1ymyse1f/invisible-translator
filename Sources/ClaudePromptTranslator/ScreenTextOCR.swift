@@ -76,6 +76,138 @@ struct ScreenTextOCRResult: Equatable, Sendable {
     let averageConfidence: Float
 }
 
+enum VisionTextRecognitionProfile: Sendable {
+    case generalOCR
+    case replyOCR
+    case liveSubtitle
+
+    var configuration: VisionTextRecognitionConfiguration {
+        switch self {
+        case .generalOCR:
+            return VisionTextRecognitionConfiguration(
+                pixelBudget: 2_097_152,
+                minimumTextHeight: 0.012,
+                accuratePassConfidenceThreshold: 0.64,
+                accuratePassCharacterThreshold: 18
+            )
+        case .replyOCR:
+            return VisionTextRecognitionConfiguration(
+                pixelBudget: 1_048_576,
+                minimumTextHeight: 0.014,
+                accuratePassConfidenceThreshold: 0.66,
+                accuratePassCharacterThreshold: 24
+            )
+        case .liveSubtitle:
+            return VisionTextRecognitionConfiguration(
+                pixelBudget: 786_432,
+                minimumTextHeight: 0.018,
+                accuratePassConfidenceThreshold: 0.62,
+                accuratePassCharacterThreshold: 14
+            )
+        }
+    }
+}
+
+/// Shared limits and retry policy for every Vision text-recognition entry point.
+/// The pixel budget is also applied to ScreenCaptureKit, so a large selection is
+/// never materialized as a full-resolution image before OCR.
+struct VisionTextRecognitionConfiguration: Equatable, Sendable {
+    let pixelBudget: Int
+    let minimumTextHeight: Float
+    let accuratePassConfidenceThreshold: Float
+    let accuratePassCharacterThreshold: Int
+
+    func fittedPixelSize(width: Int, height: Int) -> (width: Int, height: Int) {
+        let safeWidth = max(width, 1)
+        let safeHeight = max(height, 1)
+        let safePixelBudget = max(pixelBudget, 1)
+        let pixels = safeWidth.multipliedReportingOverflow(by: safeHeight)
+        guard pixels.overflow || pixels.partialValue > safePixelBudget else {
+            return (safeWidth, safeHeight)
+        }
+        let scale = sqrt(Double(safePixelBudget) / (Double(safeWidth) * Double(safeHeight)))
+        return (
+            max(Int((Double(safeWidth) * scale).rounded(.down)), 1),
+            max(Int((Double(safeHeight) * scale).rounded(.down)), 1)
+        )
+    }
+
+    func shouldRunAccuratePass(
+        lineCount: Int,
+        recognizedCharacterCount: Int,
+        averageConfidence: Float
+    ) -> Bool {
+        lineCount == 0
+            || recognizedCharacterCount < accuratePassCharacterThreshold
+            || averageConfidence < accuratePassConfidenceThreshold
+    }
+}
+
+enum OCRTilePlanner {
+    static let overlapPixels = 32
+
+    static func tiles(
+        in sourceRect: CGRect,
+        pixelScale: CGFloat,
+        pixelBudget: Int,
+        overlap: Int = overlapPixels
+    ) -> [CGRect] {
+        let scale = max(pixelScale, 1)
+        let totalWidth = max(Int(ceil(sourceRect.width * scale)), 1)
+        let totalHeight = max(Int(ceil(sourceRect.height * scale)), 1)
+        let budget = max(pixelBudget, 1)
+        let totalPixels = totalWidth.multipliedReportingOverflow(by: totalHeight)
+        guard totalPixels.overflow || totalPixels.partialValue > budget else {
+            return [sourceRect]
+        }
+
+        let aspect = Double(totalWidth) / Double(totalHeight)
+        var tileWidth = min(
+            totalWidth,
+            max(Int(sqrt(Double(budget) * aspect).rounded(.down)), 1)
+        )
+        var tileHeight = min(totalHeight, max(budget / max(tileWidth, 1), 1))
+        while tileWidth * tileHeight > budget {
+            if tileWidth >= tileHeight { tileWidth -= 1 } else { tileHeight -= 1 }
+        }
+
+        let overlapWidth = min(max(overlap, 0), max(tileWidth - 1, 0))
+        let overlapHeight = min(max(overlap, 0), max(tileHeight - 1, 0))
+        let horizontalStep = max(tileWidth - overlapWidth, 1)
+        let verticalStep = max(tileHeight - overlapHeight, 1)
+
+        func offsets(total: Int, tile: Int, step: Int) -> [Int] {
+            guard total > tile else { return [0] }
+            var values: [Int] = []
+            var offset = 0
+            while offset + tile < total {
+                values.append(offset)
+                offset += step
+            }
+            let finalOffset = max(total - tile, 0)
+            if values.last != finalOffset { values.append(finalOffset) }
+            return values
+        }
+
+        var result: [CGRect] = []
+        for y in offsets(total: totalHeight, tile: tileHeight, step: verticalStep) {
+            for x in offsets(total: totalWidth, tile: tileWidth, step: horizontalStep) {
+                let pixelWidth = min(tileWidth, totalWidth - x)
+                let pixelHeight = min(tileHeight, totalHeight - y)
+                result.append(
+                    CGRect(
+                        x: sourceRect.minX + CGFloat(x) / scale,
+                        y: sourceRect.minY + CGFloat(y) / scale,
+                        width: CGFloat(pixelWidth) / scale,
+                        height: CGFloat(pixelHeight) / scale
+                    )
+                )
+            }
+        }
+        return result
+    }
+}
+
 enum ScreenTextOCRError: LocalizedError {
     case screenRecordingPermissionRequired
     case displayUnavailable
@@ -119,16 +251,41 @@ enum ScreenRegionSourceWindowPolicy {
 }
 
 enum ScreenTextOCRRecognizer {
-    static func recognize(in image: CGImage) throws -> ScreenTextOCRResult {
-        let automatic = perform(in: image, recognitionLanguages: nil)
+    static func recognize(
+        in image: CGImage,
+        profile: VisionTextRecognitionProfile = .generalOCR
+    ) throws -> ScreenTextOCRResult {
+        try recognize(in: image, configuration: profile.configuration)
+    }
+
+    static func recognize(
+        in image: CGImage,
+        configuration: VisionTextRecognitionConfiguration
+    ) throws -> ScreenTextOCRResult {
+        let automatic = perform(
+            in: image,
+            recognitionLevel: .fast,
+            usesLanguageCorrection: false,
+            recognitionLanguages: nil,
+            configuration: configuration
+        )
         let best: OCRPass
-        if automatic.lines.isEmpty || automatic.averageConfidence < 0.58 {
+        if configuration.shouldRunAccuratePass(
+            lineCount: automatic.lines.count,
+            recognizedCharacterCount: automatic.recognizedCharacterCount,
+            averageConfidence: automatic.averageConfidence
+        ) {
             let detectedIdentifier = SelectionLanguageRouter.detectedLanguageIdentifier(
                 in: automatic.lines.map(\.text).joined(separator: "\n")
             )
             let multilingual = perform(
                 in: image,
-                recognitionLanguages: preferredRecognitionLanguages(for: detectedIdentifier)
+                recognitionLevel: .accurate,
+                usesLanguageCorrection: true,
+                recognitionLanguages: automatic.lines.isEmpty
+                    ? nil
+                    : preferredRecognitionLanguages(for: detectedIdentifier),
+                configuration: configuration
             )
             best = score(multilingual) > score(automatic) ? multilingual : automatic
         } else {
@@ -158,6 +315,10 @@ enum ScreenTextOCRRecognizer {
     private struct OCRPass {
         let lines: [OCRLine]
 
+        var recognizedCharacterCount: Int {
+            lines.reduce(0) { $0 + $1.text.count }
+        }
+
         var averageConfidence: Float {
             guard !lines.isEmpty else { return 0 }
             return lines.reduce(0) { $0 + $1.confidence } / Float(lines.count)
@@ -180,41 +341,46 @@ enum ScreenTextOCRRecognizer {
 
     private static func perform(
         in image: CGImage,
-        recognitionLanguages: [String]?
+        recognitionLevel: VNRequestTextRecognitionLevel,
+        usesLanguageCorrection: Bool,
+        recognitionLanguages: [String]?,
+        configuration: VisionTextRecognitionConfiguration
     ) -> OCRPass {
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate
-        request.usesLanguageCorrection = true
-        request.minimumTextHeight = 0.012
-        if let recognitionLanguages {
-            request.automaticallyDetectsLanguage = false
-            request.recognitionLanguages = recognitionLanguages
-        } else {
-            request.automaticallyDetectsLanguage = true
-        }
-
-        do {
-            try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
-        } catch {
-            return OCRPass(lines: [])
-        }
-
-        let lines = (request.results ?? []).compactMap { observation -> OCRLine? in
-            guard let candidate = observation.topCandidates(1).first,
-                  candidate.confidence >= 0.35 else {
-                return nil
+        autoreleasepool {
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = recognitionLevel
+            request.usesLanguageCorrection = usesLanguageCorrection
+            request.minimumTextHeight = configuration.minimumTextHeight
+            if let recognitionLanguages {
+                request.automaticallyDetectsLanguage = false
+                request.recognitionLanguages = recognitionLanguages
+            } else {
+                request.automaticallyDetectsLanguage = true
             }
-            let text = candidate.string
-                .replacingOccurrences(of: "\u{00A0}", with: " ")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { return nil }
-            return OCRLine(
-                text: text,
-                confidence: candidate.confidence,
-                boundingBox: observation.boundingBox
-            )
+
+            do {
+                try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+            } catch {
+                return OCRPass(lines: [])
+            }
+
+            let lines = (request.results ?? []).compactMap { observation -> OCRLine? in
+                guard let candidate = observation.topCandidates(1).first,
+                      candidate.confidence >= 0.35 else {
+                    return nil
+                }
+                let text = candidate.string
+                    .replacingOccurrences(of: "\u{00A0}", with: " ")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !text.isEmpty else { return nil }
+                return OCRLine(
+                    text: text,
+                    confidence: candidate.confidence,
+                    boundingBox: observation.boundingBox
+                )
+            }
+            return OCRPass(lines: lines)
         }
-        return OCRPass(lines: lines)
     }
 
     private static func render(lines: [OCRLine]) -> String {
@@ -239,10 +405,34 @@ struct ScreenRegionOCRService {
         sourceApplication: NSRunningApplication,
         authorizationCheck: @MainActor () -> Bool
     ) async throws -> ScreenTextOCRResult {
+        try await recognize(
+            region: region,
+            sourceApplication: sourceApplication,
+            profile: .generalOCR,
+            authorizationCheck: authorizationCheck
+        )
+    }
+
+    func recognize(
+        region: ScreenRegionSelection,
+        sourceApplication: NSRunningApplication,
+        profile: VisionTextRecognitionProfile,
+        authorizationCheck: @MainActor () -> Bool
+    ) async throws -> ScreenTextOCRResult {
+        let recognitionConfiguration = profile.configuration
         guard authorizationCheck() else { throw CancellationError() }
+        if case .generalOCR = profile {
+            return try await recognizeTiledRegion(
+                region: region,
+                sourceApplication: sourceApplication,
+                recognitionConfiguration: recognitionConfiguration,
+                authorizationCheck: authorizationCheck
+            )
+        }
         let image = try await capture(
             region: region,
             sourceApplication: sourceApplication,
+            recognitionConfiguration: recognitionConfiguration,
             authorizationCheck: authorizationCheck
         )
         try Task.checkCancellation()
@@ -250,7 +440,10 @@ struct ScreenRegionOCRService {
         let sendableImage = SendableCGImage(value: image)
         let recognitionTask = Task.detached(priority: .userInitiated) {
             try Task.checkCancellation()
-            return try ScreenTextOCRRecognizer.recognize(in: sendableImage.value)
+            return try ScreenTextOCRRecognizer.recognize(
+                in: sendableImage.value,
+                configuration: recognitionConfiguration
+            )
         }
         return try await withTaskCancellationHandler {
             let result = try await recognitionTask.value
@@ -262,11 +455,137 @@ struct ScreenRegionOCRService {
         }
     }
 
-    private func capture(
+    private struct CaptureContext {
+        let filter: SCContentFilter
+        let sourceRect: CGRect
+        let pixelScale: CGFloat
+    }
+
+    private func recognizeTiledRegion(
+        region: ScreenRegionSelection,
+        sourceApplication: NSRunningApplication,
+        recognitionConfiguration: VisionTextRecognitionConfiguration,
+        authorizationCheck: @MainActor () -> Bool
+    ) async throws -> ScreenTextOCRResult {
+        let context = try await prepareCaptureContext(
+            region: region,
+            sourceApplication: sourceApplication,
+            authorizationCheck: authorizationCheck
+        )
+        let tiles = OCRTilePlanner.tiles(
+            in: context.sourceRect,
+            pixelScale: context.pixelScale,
+            pixelBudget: recognitionConfiguration.pixelBudget
+        )
+        var results: [ScreenTextOCRResult] = []
+        results.reserveCapacity(min(tiles.count, 16))
+
+        for tile in tiles {
+            try Task.checkCancellation()
+            guard authorizationCheck() else { throw CancellationError() }
+            let image = try await captureImage(
+                context: context,
+                sourceRect: tile,
+                recognitionConfiguration: recognitionConfiguration,
+                preservesNativeResolution: true
+            )
+            try Task.checkCancellation()
+            guard authorizationCheck() else { throw CancellationError() }
+            let sendableImage = SendableCGImage(value: image)
+            do {
+                let result = try await Task.detached(priority: .userInitiated) {
+                    try Task.checkCancellation()
+                    return try ScreenTextOCRRecognizer.recognize(
+                        in: sendableImage.value,
+                        configuration: recognitionConfiguration
+                    )
+                }.value
+                results.append(result)
+            } catch ScreenTextOCRError.noTextRecognized {
+                continue
+            }
+        }
+        guard authorizationCheck() else { throw CancellationError() }
+        return try Self.mergedTileResults(results)
+    }
+
+    nonisolated private static func mergedTileResults(
+        _ results: [ScreenTextOCRResult]
+    ) throws -> ScreenTextOCRResult {
+        var lines: [String] = []
+        var recentLines: [String] = []
+        var confidenceTotal: Float = 0
+        var confidenceWeight = 0
+        for result in results {
+            confidenceTotal += result.averageConfidence * Float(max(result.lineCount, 1))
+            confidenceWeight += max(result.lineCount, 1)
+            for line in result.text.components(separatedBy: .newlines) {
+                let normalized = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !normalized.isEmpty else { continue }
+                if recentLines.contains(normalized) { continue }
+                lines.append(normalized)
+                recentLines.append(normalized)
+                if recentLines.count > 4 { recentLines.removeFirst() }
+            }
+        }
+        guard let text = SelectionTextNormalizer.normalizedText(
+            from: lines.joined(separator: "\n"),
+            maximumCharacters: TranslationLimits.maxOCRCharacters
+        ) else {
+            throw ScreenTextOCRError.noTextRecognized
+        }
+        return ScreenTextOCRResult(
+            text: text,
+            lineCount: lines.count,
+            averageConfidence: confidenceWeight > 0
+                ? confidenceTotal / Float(confidenceWeight)
+                : 0
+        )
+    }
+
+    /// Captures one privacy-gated frame for the live subtitle producer. The
+    /// returned image has already been reduced to the subtitle pixel budget and
+    /// contains only windows owned by `sourceApplication`.
+    func captureSubtitleFrame(
         region: ScreenRegionSelection,
         sourceApplication: NSRunningApplication,
         authorizationCheck: @MainActor () -> Bool
     ) async throws -> CGImage {
+        try await capture(
+            region: region,
+            sourceApplication: sourceApplication,
+            recognitionConfiguration: VisionTextRecognitionProfile.liveSubtitle.configuration,
+            authorizationCheck: authorizationCheck
+        )
+    }
+
+    private func capture(
+        region: ScreenRegionSelection,
+        sourceApplication: NSRunningApplication,
+        recognitionConfiguration: VisionTextRecognitionConfiguration,
+        authorizationCheck: @MainActor () -> Bool
+    ) async throws -> CGImage {
+        let context = try await prepareCaptureContext(
+            region: region,
+            sourceApplication: sourceApplication,
+            authorizationCheck: authorizationCheck
+        )
+        let image = try await captureImage(
+            context: context,
+            sourceRect: context.sourceRect,
+            recognitionConfiguration: recognitionConfiguration,
+            preservesNativeResolution: false
+        )
+        try Task.checkCancellation()
+        guard authorizationCheck() else { throw CancellationError() }
+        return image
+    }
+
+    private func prepareCaptureContext(
+        region: ScreenRegionSelection,
+        sourceApplication: NSRunningApplication,
+        authorizationCheck: @MainActor () -> Bool
+    ) async throws -> CaptureContext {
         guard ScreenRecordingPermission.isGranted else {
             throw ScreenTextOCRError.screenRecordingPermissionRequired
         }
@@ -283,7 +602,6 @@ struct ScreenRegionOCRService {
             throw ScreenTextOCRError.displayUnavailable
         }
 
-        let configuration = SCStreamConfiguration()
         let sourceRect = region.sourceRect.intersection(
             CGRect(origin: .zero, size: region.screenFrame.size)
         )
@@ -305,20 +623,38 @@ struct ScreenRegionOCRService {
         // started. Pixels from password managers or any other overlapping App
         // are excluded even if the user drags the rectangle across them.
         let filter = SCContentFilter(display: display, including: sourceWindows)
+        return CaptureContext(
+            filter: filter,
+            sourceRect: sourceRect,
+            pixelScale: max(CGFloat(filter.pointPixelScale), 1)
+        )
+    }
+
+    private func captureImage(
+        context: CaptureContext,
+        sourceRect: CGRect,
+        recognitionConfiguration: VisionTextRecognitionConfiguration,
+        preservesNativeResolution: Bool
+    ) async throws -> CGImage {
+        let configuration = SCStreamConfiguration()
         configuration.sourceRect = sourceRect
-        let scale = max(CGFloat(filter.pointPixelScale), 1)
-        configuration.width = max(Int(sourceRect.width * scale), 1)
-        configuration.height = max(Int(sourceRect.height * scale), 1)
+        let requestedWidth = max(Int(sourceRect.width * context.pixelScale), 1)
+        let requestedHeight = max(Int(sourceRect.height * context.pixelScale), 1)
+        let captureSize = recognitionConfiguration.fittedPixelSize(
+            width: requestedWidth,
+            height: requestedHeight
+        )
+        configuration.width = preservesNativeResolution ? requestedWidth : captureSize.width
+        configuration.height = preservesNativeResolution ? requestedHeight : captureSize.height
         configuration.showsCursor = false
+        configuration.queueDepth = 2
 
         try Task.checkCancellation()
-        guard authorizationCheck() else { throw CancellationError() }
         let image = try await SCScreenshotManager.captureImage(
-            contentFilter: filter,
+            contentFilter: context.filter,
             configuration: configuration
         )
         try Task.checkCancellation()
-        guard authorizationCheck() else { throw CancellationError() }
         return image
     }
 }

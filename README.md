@@ -1,4 +1,4 @@
-# 无感翻译（ClaudePromptTranslator 0.7.0）
+# 无感翻译（ClaudePromptTranslator 0.8.0）
 
 一个原生 macOS 跨应用选区翻译工具。它的主流程已经从“只识别 AI 聊天输入框”调整为：
 
@@ -21,6 +21,8 @@ Accessibility 快速读取（不碰剪贴板）
 旧的 Claude、ChatGPT、Gemini 输入与回复翻译仍保留为“AI 兼容模式”，但不再是通用选区翻译的前置条件。
 
 > App 可见名称改为“无感翻译”，可执行文件名和 bundle id 仍保持 `ClaudePromptTranslator` / `local.codex.ClaudePromptTranslator`，避免升级时无故丢失已有的辅助功能授权。
+
+0.8.0 已完成核心轻量化、资源生命周期、翻译队列、回复扫描预算、OCR/字幕内存边界和安全打包。浏览器 native bridge、Safari `.appex`、私有 ASR 生产 catalog/引擎、Sparkle 嵌入签名以及 Developer ID 公证仍是后续门，不能把现有前端或接口代码当作已分发功能。详见 [1.0 实施状态](docs/LIGHTWEIGHT_1_0_STATUS.md) 与 [性能/发布门](docs/PERFORMANCE_GATES.md)。
 
 ## 当前功能
 

@@ -1,6 +1,7 @@
 import AppKit
 import Carbon.HIToolbox
 import CoreGraphics
+import OSLog
 
 enum DeliveryError: LocalizedError {
     case accessibilityPermissionRequired
@@ -804,21 +805,11 @@ struct TextDeliveryService {
         guard ProcessInfo.processInfo.environment["CPT_DEBUG_DELIVERY"] == "1" else {
             return
         }
-
-        let line = "\(Date()) \(message())\n"
-        let url = URL(fileURLWithPath: "/tmp/claude_prompt_translator_delivery_debug.log")
-        guard let data = line.data(using: .utf8) else {
-            return
-        }
-
-        if FileManager.default.fileExists(atPath: url.path),
-           let handle = try? FileHandle(forWritingTo: url) {
-            defer { try? handle.close() }
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: data)
-        } else {
-            try? data.write(to: url)
-        }
+        let event = message()
+        Logger(
+            subsystem: "local.codex.ClaudePromptTranslator",
+            category: "DeliveryDebug"
+        ).debug("event=\(event, privacy: .private(mask: .hash))")
 #endif
     }
 }

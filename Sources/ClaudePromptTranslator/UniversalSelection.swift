@@ -22,7 +22,7 @@ enum SelectionDiagnostics {
 
     static func record(_ message: String) {
         guard isEnabled else { return }
-        logger.notice("CPTSelection: \(message, privacy: .public)")
+        logger.debug("CPTSelection event=\(message, privacy: .private(mask: .hash))")
     }
 }
 

@@ -252,10 +252,10 @@ final class UsageGuideController: NSObject, NSWindowDelegate {
 
     func translateAIResponseFromGuide() {
         SelectionDiagnostics.record("guide response translation requested")
-        state.actionMessage = model.unifiedBarController.isManualResponseOCRRetryAvailable
+        state.actionMessage = model.isManualResponseOCRRetryAvailable
             ? "你已明确选择 OCR 重试；只会截取当前 AI 窗口中近似计算的对话区域，可能包含同列可见历史对话。"
             : "正在优先读取同一 AI App 的选区；没有选区时才读取最新回复，本次不会使用 OCR。"
-        guard let targetApplication = model.unifiedBarController.responseTargetApplication else {
+        guard let targetApplication = model.loadedResponseTargetApplication else {
             state.actionMessage = "请先在上一步选择并显示 ChatGPT、Claude 或其他 AI 窗口。"
             return
         }
@@ -683,7 +683,7 @@ private struct UsageGuideView: View {
         if model.isResponseTranslating {
             return "取消回复读取"
         }
-        if model.unifiedBarController.isManualResponseOCRRetryAvailable {
+        if model.isManualResponseOCRRetryAvailable {
             return "使用 OCR 重试（需屏幕录制）"
         }
         return "翻译已选/最新回复"

@@ -4,6 +4,49 @@ import XCTest
 @testable import ClaudePromptTranslator
 
 final class TranslationClientTests: XCTestCase {
+    func testAppLaunchEnvironmentSkipsRuntimeOnlyForXCTestHosts() {
+        XCTAssertTrue(
+            AppLaunchEnvironmentPolicy.isUnitTestHost([
+                "XCTestConfigurationFilePath": "/private/tmp/test.xctestconfiguration"
+            ])
+        )
+        XCTAssertTrue(
+            AppLaunchEnvironmentPolicy.isUnitTestHost([
+                "XCTestBundlePath": "/private/tmp/ClaudePromptTranslatorTests.xctest"
+            ])
+        )
+        XCTAssertFalse(
+            AppLaunchEnvironmentPolicy.isUnitTestHost([
+                "PATH": "/usr/bin:/bin",
+                "CPT_DEBUG_SELECTION": "1"
+            ])
+        )
+    }
+
+    func testResponseScanBudgetUsesTwoThousandThenSixHundredNodesPerPID() {
+        XCTAssertEqual(
+            AIResponseScanBudget.nodeLimit(
+                previousProcessIdentifier: nil,
+                currentProcessIdentifier: 42
+            ),
+            2_000
+        )
+        XCTAssertEqual(
+            AIResponseScanBudget.nodeLimit(
+                previousProcessIdentifier: 42,
+                currentProcessIdentifier: 42
+            ),
+            600
+        )
+        XCTAssertEqual(
+            AIResponseScanBudget.nodeLimit(
+                previousProcessIdentifier: 42,
+                currentProcessIdentifier: 43
+            ),
+            2_000
+        )
+    }
+
     func testAppThemeExposesClaudeAndCyberpunkChoicesWithLegacyMigration() {
         XCTAssertTrue(AppTheme.allCases.contains(.claude))
         XCTAssertTrue(AppTheme.allCases.contains(.dark))

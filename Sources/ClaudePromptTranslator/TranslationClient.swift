@@ -754,16 +754,23 @@ extension GoogleTranslateClient: TextTranslationProvider {
 struct AutomaticTranslationClient: Sendable {
     func translate(
         _ text: String,
-        to targetLanguage: TargetLanguage
+        to targetLanguage: TargetLanguage,
+        workKind: TranslationWorkKind = .manual
     ) async throws -> TranslationProviderOutput {
 #if canImport(Translation)
         if #available(macOS 15.0, *) {
             do {
-                let translated = try await AppleTranslationCoordinator.shared.translateText(
-                    text,
-                    targetLanguageCode: targetLanguage.appleLanguageCode,
-                    maximumCharacters: TranslationLimits.maxInputCharacters
-                )
+                let targetLanguageCode = targetLanguage.appleLanguageCode
+                let translated = try await TranslationWorkBroker.shared.submit(
+                    text: text,
+                    kind: workKind
+                ) { sourceText in
+                    try await AppleTranslationCoordinator.shared.translateText(
+                        sourceText,
+                        targetLanguageCode: targetLanguageCode,
+                        maximumCharacters: TranslationLimits.maxInputCharacters
+                    )
+                }
                 return TranslationProviderOutput(
                     text: PromptTranslationPolisher.polish(
                         translated,
@@ -789,15 +796,23 @@ struct AutomaticTranslationClient: Sendable {
         throw TranslationProviderUnavailableError.localOnlyModeUnsupported
     }
 
-    func translateToChinese(_ text: String) async throws -> TranslationProviderOutput {
+    func translateToChinese(
+        _ text: String,
+        workKind: TranslationWorkKind = .manual
+    ) async throws -> TranslationProviderOutput {
 #if canImport(Translation)
         if #available(macOS 15.0, *) {
             do {
-                let translated = try await AppleTranslationCoordinator.shared.translateText(
-                    text,
-                    targetLanguageCode: "zh-Hans",
-                    maximumCharacters: TranslationLimits.maxResponseCharacters
-                )
+                let translated = try await TranslationWorkBroker.shared.submit(
+                    text: text,
+                    kind: workKind
+                ) { sourceText in
+                    try await AppleTranslationCoordinator.shared.translateText(
+                        sourceText,
+                        targetLanguageCode: "zh-Hans",
+                        maximumCharacters: TranslationLimits.maxResponseCharacters
+                    )
+                }
                 return TranslationProviderOutput(
                     text: translated,
                     providerName: "Apple 本地翻译"

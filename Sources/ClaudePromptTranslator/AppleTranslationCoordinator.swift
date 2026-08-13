@@ -50,6 +50,11 @@ final class AppleTranslationCoordinator: ObservableObject {
     private var queuedRequests: [PendingRequest] = []
     private var panel: NSPanel?
     private var hostingView: NSHostingView<AppleTranslationHostView>?
+    private var hostReleaseTask: Task<Void, Never>?
+
+    private static let maximumQueuedRequests = 2
+    private static let maximumInFlightTextBytes = 1_048_576
+    private static let hostIdleReleaseDelay: Duration = .seconds(30)
 
     private init() {}
 
@@ -168,16 +173,31 @@ final class AppleTranslationCoordinator: ObservableObject {
             maximumCharacters: maximumCharacters,
             continuation: continuation
         )
+        let waitingBytes = queuedRequests.reduce(pendingRequest?.text.utf8.count ?? 0) {
+            $0 + $1.text.utf8.count
+        }
+        guard waitingBytes + text.utf8.count <= Self.maximumInFlightTextBytes else {
+            continuation.resume(
+                throwing: TranslationWorkBrokerError.textBudgetExceeded(
+                    limitBytes: Self.maximumInFlightTextBytes
+                )
+            )
+            return
+        }
         guard pendingRequest == nil else {
+            guard queuedRequests.count < Self.maximumQueuedRequests else {
+                continuation.resume(throwing: TranslationWorkBrokerError.manualQueueFull)
+                return
+            }
             queuedRequests.append(request)
-            ensureHostPanel()
-            panel?.orderFrontRegardless()
             return
         }
         begin(request)
     }
 
     private func begin(_ request: PendingRequest) {
+        hostReleaseTask?.cancel()
+        hostReleaseTask = nil
         pendingRequest = request
         statusText = "正在准备 Apple 本地翻译…"
         SelectionDiagnostics.record("apple setup request started")
@@ -209,6 +229,7 @@ final class AppleTranslationCoordinator: ObservableObject {
         request.continuation.resume(with: result)
         if queuedRequests.isEmpty {
             panel?.orderOut(nil)
+            scheduleHostRelease()
         } else {
             let next = queuedRequests.removeFirst()
             begin(next)
@@ -237,6 +258,31 @@ final class AppleTranslationCoordinator: ObservableObject {
         }
         let request = queuedRequests.remove(at: index)
         request.continuation.resume(throwing: CancellationError())
+    }
+
+    func releaseIdleResources() {
+        guard pendingRequest == nil, queuedRequests.isEmpty else {
+            return
+        }
+        hostReleaseTask?.cancel()
+        hostReleaseTask = nil
+        configuration = nil
+        hostingView = nil
+        panel?.contentView = nil
+        panel?.close()
+        panel = nil
+    }
+
+    private func scheduleHostRelease() {
+        hostReleaseTask?.cancel()
+        hostReleaseTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: Self.hostIdleReleaseDelay)
+            } catch {
+                return
+            }
+            self?.releaseIdleResources()
+        }
     }
 
     private func ensureHostPanel() {

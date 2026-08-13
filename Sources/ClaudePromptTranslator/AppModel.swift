@@ -80,6 +80,7 @@ final class AppModel: ObservableObject {
     @Published var unifiedBarEnabled: Bool {
         didSet {
             UserDefaults.standard.set(unifiedBarEnabled, forKey: DefaultsKey.unifiedBarEnabled)
+            reconcileRuntime()
         }
     }
     @Published var floatingTriggerEnabled: Bool {
@@ -90,6 +91,7 @@ final class AppModel: ObservableObject {
     @Published var responseTranslationEnabled: Bool {
         didSet {
             UserDefaults.standard.set(responseTranslationEnabled, forKey: DefaultsKey.responseTranslationEnabled)
+            reconcileRuntime()
         }
     }
     @Published var clipboardCompatibilityEnabled: Bool {
@@ -116,10 +118,8 @@ final class AppModel: ObservableObject {
     @Published var selectionDetectionEnabled: Bool {
         didSet {
             UserDefaults.standard.set(selectionDetectionEnabled, forKey: DefaultsKey.selectionDetectionEnabled)
-            if selectionDetectionEnabled, translatorEnabled {
-                selectionMonitor.start()
-            } else {
-                selectionMonitor.stop()
+            reconcileRuntime()
+            if !selectionDetectionEnabled {
                 dismissSelectionOverlay()
             }
         }
@@ -138,11 +138,7 @@ final class AppModel: ObservableObject {
                 hoverTranslationEnabled,
                 forKey: DefaultsKey.hoverTranslationEnabled
             )
-            if hoverTranslationEnabled, translatorEnabled {
-                hoverMonitor.start()
-            } else {
-                hoverMonitor.stop()
-            }
+            reconcileRuntime()
         }
     }
     @Published var automaticLanguageRoutingEnabled: Bool {
@@ -170,7 +166,7 @@ final class AppModel: ObservableObject {
     @Published var appTheme: AppTheme {
         didSet {
             UserDefaults.standard.set(appTheme.rawValue, forKey: DefaultsKey.appTheme)
-            panelController.applyAppearance()
+            storedPanelController?.applyAppearance()
         }
     }
     @Published var responseSourceText = ""
@@ -190,7 +186,7 @@ final class AppModel: ObservableObject {
     @Published var selectionDisplayMode: SubtitleDisplayMode = .bilingual {
         didSet {
             UserDefaults.standard.set(selectionDisplayMode.rawValue, forKey: DefaultsKey.selectionDisplayMode)
-            selectionOverlayController.refresh()
+            storedSelectionOverlayController?.refresh()
         }
     }
     @Published var subtitleTranslationActive = false
@@ -201,13 +197,13 @@ final class AppModel: ObservableObject {
     @Published var subtitleDisplayMode: SubtitleDisplayMode = .bilingual {
         didSet {
             UserDefaults.standard.set(subtitleDisplayMode.rawValue, forKey: DefaultsKey.subtitleDisplayMode)
-            subtitleOverlayController.refresh()
+            storedSubtitleOverlayController?.refresh()
         }
     }
     @Published var subtitleOverlayStyle: SubtitleOverlayStyle = .dark {
         didSet {
             UserDefaults.standard.set(subtitleOverlayStyle.rawValue, forKey: DefaultsKey.subtitleOverlayStyle)
-            subtitleOverlayController.refresh()
+            storedSubtitleOverlayController?.refresh()
         }
     }
     @Published var subtitleFontSize: CGFloat = 22 {
@@ -218,15 +214,38 @@ final class AppModel: ObservableObject {
                 return
             }
             UserDefaults.standard.set(Double(subtitleFontSize), forKey: DefaultsKey.subtitleFontSize)
-            subtitleOverlayController.refresh()
+            storedSubtitleOverlayController?.refresh()
         }
     }
 
     let detector = ClaudeContextDetector()
 
-    lazy var unifiedBarController = UnifiedEdgeBarController(model: self)
-    lazy var selectionOverlayController = SelectionOverlayController(model: self)
-    lazy var subtitleOverlayController = SubtitleOverlayController(model: self)
+    private var storedUnifiedBarController: UnifiedEdgeBarController?
+    private var storedSelectionOverlayController: SelectionOverlayController?
+    private var storedSubtitleOverlayController: SubtitleOverlayController?
+
+    var unifiedBarController: UnifiedEdgeBarController {
+        if let storedUnifiedBarController { return storedUnifiedBarController }
+        let controller = UnifiedEdgeBarController(model: self)
+        storedUnifiedBarController = controller
+        return controller
+    }
+
+    private var selectionOverlayController: SelectionOverlayController {
+        selectionOverlayReleaseTask?.cancel()
+        selectionOverlayReleaseTask = nil
+        if let storedSelectionOverlayController { return storedSelectionOverlayController }
+        let controller = SelectionOverlayController(model: self)
+        storedSelectionOverlayController = controller
+        return controller
+    }
+
+    private var subtitleOverlayController: SubtitleOverlayController {
+        if let storedSubtitleOverlayController { return storedSubtitleOverlayController }
+        let controller = SubtitleOverlayController(model: self)
+        storedSubtitleOverlayController = controller
+        return controller
+    }
 
     private let translator = AutomaticTranslationClient()
     private let deliveryService = TextDeliveryService()
@@ -234,19 +253,60 @@ final class AppModel: ObservableObject {
     private let hoverReader = HoverTextReader()
     private let screenRegionOCRService = ScreenRegionOCRService()
     private let subtitleTranslationCache = SubtitleTranslationCache()
-    private lazy var panelController = PromptPanelController(model: self)
-    private lazy var selectionMonitor = UniversalSelectionMonitor(
-        isApplicationAllowed: { [weak self] app in
-            self?.isCaptureAllowed(in: app) == true
+    private lazy var subtitlePipeline = LiveSubtitlePipeline(
+        targetResolver: { text in
+            // Cue recognition runs outside the main actor. Keep routing pure;
+            // presentation can still apply UI-owned learned preferences.
+            SelectionLanguageRouter.route(for: text).targetLanguage
         },
-        handler: { [weak self] app, hints in
-            self?.inspectPassiveSelection(in: app, hints: hints)
+        translator: { [translator] text, target in
+            try await translator.translate(text, to: target, workKind: .subtitle)
         }
     )
-    private lazy var hoverMonitor = HoverTranslationMonitor { [weak self] app, point in
-        self?.inspectHoverText(in: app, at: point)
+    private var storedPanelController: PromptPanelController?
+    private var storedSelectionMonitor: UniversalSelectionMonitor?
+    private var storedHoverMonitor: HoverTranslationMonitor?
+    private var storedScreenRegionSelectionController: ScreenRegionSelectionController?
+
+    private var panelController: PromptPanelController {
+        panelReleaseTask?.cancel()
+        panelReleaseTask = nil
+        if let storedPanelController { return storedPanelController }
+        let controller = PromptPanelController(model: self)
+        storedPanelController = controller
+        return controller
     }
-    private lazy var screenRegionSelectionController = ScreenRegionSelectionController()
+
+    private var selectionMonitor: UniversalSelectionMonitor {
+        if let storedSelectionMonitor { return storedSelectionMonitor }
+        let controller = UniversalSelectionMonitor(
+            isApplicationAllowed: { [weak self] app in
+                self?.isCaptureAllowed(in: app) == true
+            },
+            handler: { [weak self] app, hints in
+                self?.storedUnifiedBarController?.refresh()
+                self?.inspectPassiveSelection(in: app, hints: hints)
+            }
+        )
+        storedSelectionMonitor = controller
+        return controller
+    }
+
+    private var hoverMonitor: HoverTranslationMonitor {
+        if let storedHoverMonitor { return storedHoverMonitor }
+        let controller = HoverTranslationMonitor { [weak self] app, point in
+            self?.inspectHoverText(in: app, at: point)
+        }
+        storedHoverMonitor = controller
+        return controller
+    }
+
+    private var screenRegionSelectionController: ScreenRegionSelectionController {
+        if let storedScreenRegionSelectionController { return storedScreenRegionSelectionController }
+        let controller = ScreenRegionSelectionController()
+        storedScreenRegionSelectionController = controller
+        return controller
+    }
     private var lastInputTarget: InputTarget?
     private var detectedSelection: UniversalTextSelection?
     private var selectionCaptureTask: Task<Void, Never>?
@@ -255,16 +315,24 @@ final class AppModel: ObservableObject {
     private var hoverCaptureTask: Task<Void, Never>?
     private var screenOCRTask: Task<Void, Never>?
     private var subtitleTask: Task<Void, Never>?
+    private var subtitleCaptureTask: Task<Void, Never>?
+    private var subtitleEventTask: Task<Void, Never>?
+    private var subtitleSequence: UInt64 = 0
     private var inputTranslationTask: Task<Void, Never>?
     private var inputTranslationGeneration: UInt64 = 0
     private var selectionGeneration = 0
     private var lastPassiveSelectionFingerprint = ""
     private var recentResponseSelectionSnapshot: RecentResponseSelectionSnapshot?
     private var responseSelectionExpiryTask: Task<Void, Never>?
+    private var panelReleaseTask: Task<Void, Never>?
+    private var selectionOverlayReleaseTask: Task<Void, Never>?
     private var lastHoverFingerprint = ""
     private var lastHoverDate = Date.distantPast
     private var selectionFilterNote = ""
     private var translationPreferenceProfile = TranslationPreferenceProfile()
+    private var runtimeCoordinator = AppRuntimeCoordinator()
+    private var runtimeMemoryPressureMonitor: RuntimeMemoryPressureMonitor?
+    private var lastRuntimeForegroundApplication: NSRunningApplication?
 
     init() {
         let savedTarget = UserDefaults.standard.string(forKey: DefaultsKey.targetLanguage)
@@ -432,20 +500,140 @@ final class AppModel: ObservableObject {
     }
 #endif
 
+    func startRuntimeCoordination(
+        foregroundApplication: NSRunningApplication? = NSWorkspace.shared.frontmostApplication
+    ) {
+        if runtimeMemoryPressureMonitor == nil {
+            let monitor = RuntimeMemoryPressureMonitor { [weak self] pressure in
+                self?.handleRuntimeMemoryPressure(pressure)
+            }
+            runtimeMemoryPressureMonitor = monitor
+            monitor.start()
+        }
+        reconcileRuntime(foregroundApplication: foregroundApplication)
+    }
+
+    func stopRuntimeCoordination() {
+        runtimeMemoryPressureMonitor?.stop()
+        runtimeMemoryPressureMonitor = nil
+        applyRuntimeTransition(runtimeCoordinator.handle(.terminate))
+    }
+
+    func setRuntimeSuspended(_ suspended: Bool) {
+        applyRuntimeTransition(runtimeCoordinator.handle(.setSuspended(suspended)))
+        if !suspended {
+            reconcileRuntime()
+        }
+    }
+
+    func reconcileRuntime(
+        foregroundApplication: NSRunningApplication? = NSWorkspace.shared.frontmostApplication
+    ) {
+        if let foregroundApplication, !isHelperApp(foregroundApplication) {
+            lastRuntimeForegroundApplication = foregroundApplication
+        }
+        let foreground = foregroundApplication.flatMap { isHelperApp($0) ? nil : $0 }
+            ?? lastRuntimeForegroundApplication
+        let foregroundIsAI = foreground.map {
+            isCaptureAllowed(in: $0) && detector.isAIContext($0)
+        } ?? false
+        let context = RuntimeContext(
+            translatorEnabled: translatorEnabled,
+            accessibilityTrusted: AccessibilityPermission.isTrusted,
+            selectionEnabled: selectionDetectionEnabled,
+            hoverEnabled: hoverTranslationEnabled,
+            unifiedBarEnabled: unifiedBarEnabled,
+            responseTranslationEnabled: responseTranslationEnabled,
+            foregroundIsAI: foregroundIsAI,
+            subtitleActive: subtitleTranslationActive,
+            promptUIVisible: storedPanelController?.isVisible == true,
+            guideUIVisible: false
+        )
+        applyRuntimeTransition(runtimeCoordinator.handle(.reconcile(context)))
+        if runtimeCoordinator.demand.contains(.aiContext) {
+            storedUnifiedBarController?.refresh()
+        }
+    }
+
+    private func applyRuntimeTransition(_ transition: RuntimeTransition) {
+        if transition.stopped.contains(.selection) {
+            storedSelectionMonitor?.stop()
+        }
+        if transition.stopped.contains(.hover) {
+            storedHoverMonitor?.stop()
+        }
+        if transition.stopped.contains(.aiContext) {
+            storedUnifiedBarController?.stop()
+        }
+        if transition.stopped.contains(.subtitle), subtitleTranslationActive {
+            stopSubtitleTranslation(reconcileAfterStop: false)
+        }
+
+        if transition.started.contains(.selection) {
+            selectionMonitor.start()
+        }
+        if transition.started.contains(.hover) {
+            hoverMonitor.start()
+        }
+        if transition.started.contains(.aiContext) {
+            unifiedBarController.start()
+        }
+    }
+
+    private func handleRuntimeMemoryPressure(_ pressure: RuntimeMemoryPressure) {
+        let actions = MemoryPressurePolicy.actions(for: pressure)
+        if actions.contains(.trimCaches) {
+            Task { await subtitleTranslationCache.removeAll() }
+            storedUnifiedBarController?.trimCachesForMemoryPressure()
+        }
+        if actions.contains(.releaseHiddenUI) {
+            if storedPanelController?.isVisible != true {
+                storedPanelController?.releaseResources()
+                storedPanelController = nil
+            }
+            if storedSelectionOverlayController?.isVisible != true {
+                storedSelectionOverlayController?.releaseResources()
+                storedSelectionOverlayController = nil
+            }
+            if !subtitleTranslationActive {
+                storedSubtitleOverlayController?.releaseResources()
+                storedSubtitleOverlayController = nil
+            }
+            storedUnifiedBarController?.releaseHiddenResources()
+        }
+        if actions.contains(.releaseIdleTranslationHost) {
+#if canImport(Translation)
+            if #available(macOS 15.0, *) {
+                AppleTranslationCoordinator.shared.releaseIdleResources()
+            }
+#endif
+        }
+        if actions.contains(.releaseIdleAccessibilityContexts),
+           !runtimeCoordinator.demand.contains(.selection) {
+            storedSelectionMonitor?.stop()
+            storedSelectionMonitor = nil
+        }
+    }
+
     func setTranslatorEnabled(_ enabled: Bool) {
         guard translatorEnabled != enabled else {
             return
         }
 
         translatorEnabled = enabled
+        reconcileRuntime()
         if enabled {
             statusMessage = "跨应用选区翻译已开启。"
-            startSelectionMonitoring()
-            if unifiedBarEnabled {
-                unifiedBarController.start()
-            }
         } else {
             statusMessage = "翻译器已暂停。"
+            Task {
+                await TranslationWorkBroker.shared.cancelAll()
+#if canImport(Translation)
+                if #available(macOS 15.0, *) {
+                    AppleTranslationCoordinator.shared.releaseIdleResources()
+                }
+#endif
+            }
             inputTranslationGeneration &+= 1
             inputTranslationTask?.cancel()
             inputTranslationTask = nil
@@ -457,7 +645,7 @@ final class AppModel: ObservableObject {
             selectionTranslationText = ""
             subtitleSourceText = ""
             subtitleTranslationText = ""
-            unifiedBarController.stop()
+            storedUnifiedBarController?.stop()
             clearResponseTranslation()
             hidePanel()
         }
@@ -468,11 +656,12 @@ final class AppModel: ObservableObject {
             statusMessage = "无感翻译已暂停，请从菜单栏重新开启。"
             return
         }
-        let wasEnabled = unifiedBarEnabled
         unifiedBarEnabled = true
         statusMessage = "AI 兼容边缘栏已就绪。"
-        if !wasEnabled || !unifiedBarController.isRunning {
-            unifiedBarController.start()
+        reconcileRuntime()
+        guard runtimeCoordinator.demand.contains(.aiContext) else {
+            statusMessage = "请先切换到已授权的 ChatGPT、Claude 或其他 AI 对话窗口。"
+            return
         }
         unifiedBarController.revealTemporarily()
     }
@@ -533,7 +722,7 @@ final class AppModel: ObservableObject {
             rememberTarget(app)
         }
 
-        guard !panelController.isVisible else {
+        guard storedPanelController?.isVisible != true else {
             return
         }
 
@@ -544,7 +733,22 @@ final class AppModel: ObservableObject {
     }
 
     func hidePanel() {
-        panelController.hide()
+        guard let controller = storedPanelController else { return }
+        controller.hide()
+        panelReleaseTask?.cancel()
+        panelReleaseTask = Task { @MainActor [weak self, weak controller] in
+            do {
+                try await Task.sleep(for: .seconds(60))
+            } catch {
+                return
+            }
+            guard let self,
+                  self.storedPanelController === controller,
+                  controller?.isVisible != true else { return }
+            controller?.releaseResources()
+            self.storedPanelController = nil
+            self.panelReleaseTask = nil
+        }
     }
 
     func expandPanel() {
@@ -561,7 +765,47 @@ final class AppModel: ObservableObject {
     }
 
     var isPromptPanelVisible: Bool {
-        panelController.isVisible
+        storedPanelController?.isVisible == true
+    }
+
+    var isUnifiedBarRunning: Bool {
+        storedUnifiedBarController?.isRunning == true
+    }
+
+    var isManualResponseOCRRetryAvailable: Bool {
+        storedUnifiedBarController?.isManualResponseOCRRetryAvailable == true
+    }
+
+    var loadedResponseTargetApplication: NSRunningApplication? {
+        storedUnifiedBarController?.responseTargetApplication
+    }
+
+    func selectionMonitorOwnsAXObserver(for processIdentifier: pid_t) -> Bool {
+        storedSelectionMonitor?.ownsAccessibilityObserver(for: processIdentifier) == true
+    }
+
+    func startUnifiedBar() {
+        reconcileRuntime()
+    }
+
+    func stopUnifiedBar() {
+        storedUnifiedBarController?.stop()
+    }
+
+    func refreshUnifiedBarIfLoaded() {
+        storedUnifiedBarController?.refresh()
+    }
+
+    func translateLatestResponseFromBar() {
+        unifiedBarController.translateLatestResponse()
+    }
+
+    func copyLatestResponseFromBar() {
+        guard let controller = storedUnifiedBarController else {
+            statusMessage = "当前没有可复制的回复译文。"
+            return
+        }
+        controller.copyResponseTranslation()
     }
 
     var hasResponseTranslationActivity: Bool {
@@ -626,7 +870,7 @@ final class AppModel: ObservableObject {
         }
         let blockedProcessIdentifier = app.processIdentifier
         blockedApplicationBundleIdentifiers.insert(identifier)
-        selectionMonitor.refreshPrivacyPolicy()
+        storedSelectionMonitor?.refreshPrivacyPolicy()
         inputTranslationGeneration &+= 1
         inputTranslationTask?.cancel()
         inputTranslationTask = nil
@@ -636,7 +880,7 @@ final class AppModel: ObservableObject {
         hoverCaptureTask?.cancel()
         screenOCRTask?.cancel()
         screenOCRTask = nil
-        screenRegionSelectionController.cancel()
+        storedScreenRegionSelectionController?.cancel()
         if lastInputTarget?.app.processIdentifier == app.processIdentifier {
             lastInputTarget = nil
             targetAppName = ""
@@ -645,7 +889,7 @@ final class AppModel: ObservableObject {
         stopSubtitleTranslation()
         Task { await subtitleTranslationCache.removeAll() }
         clearRecentResponseSelection(for: blockedProcessIdentifier)
-        unifiedBarController.refresh()
+        storedUnifiedBarController?.refresh()
         statusMessage = "已禁止在 \(app.localizedName ?? identifier) 中读取、OCR 或翻译内容。"
         return true
     }
@@ -683,8 +927,8 @@ final class AppModel: ObservableObject {
         let removed = blockedApplicationBundleIdentifiers.remove(identifier) != nil
         if removed {
             statusMessage = "已允许在 \(identifier) 中使用翻译功能。"
-            selectionMonitor.refreshPrivacyPolicy()
-            unifiedBarController.refresh()
+            storedSelectionMonitor?.refreshPrivacyPolicy()
+            storedUnifiedBarController?.refresh()
         }
         return removed
     }
@@ -891,33 +1135,22 @@ final class AppModel: ObservableObject {
     }
 
     func startSelectionMonitoring() {
-        guard translatorEnabled else {
-            selectionMonitor.stop()
-            hoverMonitor.stop()
-            return
-        }
-        if selectionDetectionEnabled {
-            selectionMonitor.start()
-        } else {
-            selectionMonitor.stop()
-        }
-        if hoverTranslationEnabled {
-            hoverMonitor.start()
-        } else {
-            hoverMonitor.stop()
-        }
+        reconcileRuntime()
     }
 
     func stopSelectionMonitoring() {
-        selectionMonitor.stop()
-        hoverMonitor.stop()
+        storedSelectionMonitor?.stop()
+        storedHoverMonitor?.stop()
+        storedSelectionMonitor = nil
+        storedHoverMonitor = nil
         selectionCaptureTask?.cancel()
         selectionTranslationTask?.cancel()
         selectionReplacementTask?.cancel()
         hoverCaptureTask?.cancel()
         screenOCRTask?.cancel()
         subtitleTask?.cancel()
-        screenRegionSelectionController.cancel()
+        storedScreenRegionSelectionController?.cancel()
+        storedScreenRegionSelectionController = nil
         selectionCaptureTask = nil
         selectionTranslationTask = nil
         selectionReplacementTask = nil
@@ -928,7 +1161,7 @@ final class AppModel: ObservableObject {
         responseSelectionExpiryTask?.cancel()
         responseSelectionExpiryTask = nil
         recentResponseSelectionSnapshot = nil
-        subtitleOverlayController.hide()
+        storedSubtitleOverlayController?.hide()
         Task { await subtitleTranslationCache.removeAll() }
     }
 
@@ -1051,78 +1284,158 @@ final class AppModel: ObservableObject {
 
             sourceApp.activate()
             subtitleTranslationActive = true
+            reconcileRuntime(foregroundApplication: sourceApp)
             subtitleSourceText = ""
             subtitleTranslationText = ""
             subtitleStatus = "本机 OCR 监听中"
             subtitleOverlayController.show(region: region)
+            let session = await subtitlePipeline.start()
+            startSubtitleEventConsumption(
+                session: session,
+                sourceApplication: sourceApp
+            )
+            startSubtitleFrameProduction(
+                region: region,
+                sourceApplication: sourceApp,
+                generation: session.generation
+            )
+        }
+    }
 
-            var cueProcessor = SubtitleCueProcessor()
+    private func startSubtitleFrameProduction(
+        region: ScreenRegionSelection,
+        sourceApplication: NSRunningApplication,
+        generation: UInt64
+    ) {
+        subtitleCaptureTask?.cancel()
+        subtitleSequence = 0
+        subtitleCaptureTask = Task { [weak self] in
+            guard let self else { return }
+            var previousFingerprint: UInt64?
+            var nextInterval = LiveSubtitleCadencePolicy.dynamicInterval
             while !Task.isCancelled,
                   subtitleTranslationActive,
-                  isCaptureAllowed(in: sourceApp) {
+                  isCaptureAllowed(in: sourceApplication) {
+                let intervalStart = ContinuousClock.now
                 do {
-                    guard isCaptureAllowed(in: sourceApp) else { break }
-                    let result = try await screenRegionOCRService.recognize(
+                    let image = try await screenRegionOCRService.captureSubtitleFrame(
                         region: region,
-                        sourceApplication: sourceApp,
+                        sourceApplication: sourceApplication,
                         authorizationCheck: { [weak self] in
-                            self?.isCaptureAllowed(in: sourceApp) == true
+                            self?.isCaptureAllowed(in: sourceApplication) == true
                         }
                     )
-                    guard !Task.isCancelled, isCaptureAllowed(in: sourceApp) else { break }
-                    if let cue = cueProcessor.observe(result.text) {
-                        subtitleSourceText = cue
-                        let route = languageRoute(for: cue)
-                        subtitleTargetLanguageName = route.targetLanguage.displayName
-                        subtitleStatus = "正在翻译…"
-                        subtitleOverlayController.refresh()
-
-                        let output: TranslationProviderOutput
-                        if let cached = await subtitleTranslationCache.value(
-                            for: cue,
-                            target: route.targetLanguage
-                        ) {
-                            output = cached
-                        } else {
-                            output = try await translator.translate(cue, to: route.targetLanguage)
-                            await subtitleTranslationCache.insert(
-                                output,
-                                for: cue,
-                                target: route.targetLanguage
-                            )
-                        }
-                        guard !Task.isCancelled,
-                              subtitleTranslationActive,
-                              isCaptureAllowed(in: sourceApp) else { break }
-                        subtitleTranslationText = output.text
-                        subtitleStatus = "\(output.providerName) · 区域 OCR"
-                        subtitleOverlayController.refresh()
-                    }
+                    guard !Task.isCancelled,
+                          subtitleTranslationActive,
+                          isCaptureAllowed(in: sourceApplication) else { break }
+                    subtitleSequence &+= 1
+                    let fingerprint = Self.subtitleFrameFingerprint(image)
+                    let frame = LiveSubtitleFrame(
+                        sequence: subtitleSequence,
+                        image: image,
+                        hasVisualChange: previousFingerprint != fingerprint
+                    )
+                    previousFingerprint = fingerprint
+                    let submission = await subtitlePipeline.submitFrame(
+                        frame,
+                        generation: generation
+                    )
+                    guard submission.accepted else { break }
+                    nextInterval = submission.recommendedCaptureInterval
                 } catch is CancellationError {
                     break
-                } catch ScreenTextOCRError.noTextRecognized {
-                    subtitleStatus = subtitleSourceText.isEmpty ? "等待字幕出现…" : "等待下一条字幕…"
-                    subtitleOverlayController.refresh()
                 } catch {
+                    guard subtitleTranslationActive else { break }
                     subtitleStatus = error.localizedDescription
-                    subtitleOverlayController.refresh()
+                    storedSubtitleOverlayController?.refresh()
+                    nextInterval = LiveSubtitleCadencePolicy.staticInterval
                 }
-                try? await Task.sleep(nanoseconds: 480_000_000)
+                let elapsed = intervalStart.duration(to: ContinuousClock.now)
+                let requestedDelay = Duration.milliseconds(Int64(nextInterval * 1_000)) - elapsed
+                if requestedDelay > .zero {
+                    try? await Task.sleep(for: requestedDelay)
+                }
             }
         }
     }
 
-    func stopSubtitleTranslation() {
+    private func startSubtitleEventConsumption(
+        session: LiveSubtitlePipelineSession,
+        sourceApplication: NSRunningApplication
+    ) {
+        subtitleEventTask?.cancel()
+        subtitleEventTask = Task { [weak self] in
+            guard let self else { return }
+            for await event in session.events {
+                guard !Task.isCancelled,
+                      subtitleTranslationActive,
+                      isCaptureAllowed(in: sourceApplication) else { break }
+                switch event {
+                case .recognized:
+                    if subtitleSourceText.isEmpty {
+                        subtitleStatus = "已识别画面，等待字幕稳定…"
+                    }
+                case .translationStarted(_, _, let text):
+                    subtitleSourceText = text
+                    subtitleTargetLanguageName = languageRoute(for: text).targetLanguage.displayName
+                    subtitleStatus = "正在翻译最新字幕…"
+                case .translated(_, _, let sourceText, let output, let cacheHit):
+                    subtitleSourceText = sourceText
+                    subtitleTranslationText = output.text
+                    subtitleStatus = cacheHit
+                        ? "\(output.providerName) · 本机缓存 · 区域 OCR"
+                        : "\(output.providerName) · 区域 OCR"
+                case .recognitionFailed(_, _, let message),
+                     .translationFailed(_, _, let message):
+                    subtitleStatus = message
+                case .stopped:
+                    break
+                }
+                storedSubtitleOverlayController?.refresh()
+            }
+        }
+    }
+
+    nonisolated private static func subtitleFrameFingerprint(_ image: CGImage) -> UInt64 {
+        // A small deterministic sample is sufficient for cadence selection; it
+        // is not persisted and never leaves the process.
+        var fingerprint = UInt64(image.width) &* 1_099_511_628_211
+        fingerprint ^= UInt64(image.height)
+        guard let dataProvider = image.dataProvider,
+              let data = dataProvider.data else { return fingerprint }
+        let length = CFDataGetLength(data)
+        guard length > 0, let bytes = CFDataGetBytePtr(data) else { return fingerprint }
+        let sampleCount = min(64, length)
+        for index in 0..<sampleCount {
+            let offset = index * max(length / sampleCount, 1)
+            fingerprint = (fingerprint ^ UInt64(bytes[min(offset, length - 1)]))
+                &* 1_099_511_628_211
+        }
+        return fingerprint
+    }
+
+    func stopSubtitleTranslation(reconcileAfterStop: Bool = true) {
         subtitleTask?.cancel()
         subtitleTask = nil
+        subtitleCaptureTask?.cancel()
+        subtitleCaptureTask = nil
+        subtitleEventTask?.cancel()
+        subtitleEventTask = nil
+        Task { await subtitlePipeline.stop() }
         subtitleTranslationActive = false
-        screenRegionSelectionController.cancel()
-        subtitleOverlayController.hide()
+        storedScreenRegionSelectionController?.cancel()
+        storedScreenRegionSelectionController = nil
+        storedSubtitleOverlayController?.hide()
+        storedSubtitleOverlayController?.releaseResources()
+        storedSubtitleOverlayController = nil
         subtitleSourceText = ""
         subtitleTranslationText = ""
         Task { await subtitleTranslationCache.removeAll() }
         if subtitleStatus != "未启动" {
             subtitleStatus = "已停止"
+        }
+        if reconcileAfterStop {
+            reconcileRuntime()
         }
     }
 
@@ -1323,7 +1636,8 @@ final class AppModel: ObservableObject {
         selectionGeneration += 1
         detectedSelection = nil
         selectionPhase = .idle
-        selectionOverlayController.hide()
+        storedSelectionOverlayController?.hide()
+        scheduleSelectionOverlayRelease()
     }
 
     var automaticSelectionTranslationPrivacyAcknowledged: Bool {
@@ -1390,7 +1704,7 @@ final class AppModel: ObservableObject {
                 }
                 let selection = filtered.selection
                 if selection.fingerprint == lastPassiveSelectionFingerprint,
-                   selectionOverlayController.isVisible {
+                   storedSelectionOverlayController?.isVisible == true {
                     return
                 }
                 lastPassiveSelectionFingerprint = selection.fingerprint
@@ -1562,9 +1876,16 @@ final class AppModel: ObservableObject {
         selectionTranslationTask = Task { [weak self] in
             guard let self else { return }
             do {
+                let automaticKind: TranslationWorkKind = switch selection.captureMethod {
+                case .hoverAccessibility:
+                    .hover
+                default:
+                    learnsPreference ? .manual : .automaticSelection
+                }
                 let output = try await translator.translate(
                     selection.text,
-                    to: route.targetLanguage
+                    to: route.targetLanguage,
+                    workKind: automaticKind
                 )
                 guard !Task.isCancelled,
                       selectionGeneration == generation,
@@ -1809,7 +2130,12 @@ final class AppModel: ObservableObject {
     }
 
     func clearResponseTranslation() {
-        unifiedBarController.clearResponseTranslation()
+        storedUnifiedBarController?.clearResponseTranslation()
+        responseSourceText = ""
+        responseSourceLanguageName = ""
+        responseTranslationText = ""
+        responseTranslationStatus = ""
+        isResponseTranslating = false
         refreshPanelLayout(animated: false)
     }
 
@@ -1844,10 +2170,28 @@ final class AppModel: ObservableObject {
     }
 
     private func refreshPanelLayout(animated: Bool) {
-        guard panelController.isVisible else {
+        guard let panelController = storedPanelController, panelController.isVisible else {
             return
         }
         panelController.applyPresentation(animated: animated)
+    }
+
+    private func scheduleSelectionOverlayRelease() {
+        guard let controller = storedSelectionOverlayController else { return }
+        selectionOverlayReleaseTask?.cancel()
+        selectionOverlayReleaseTask = Task { @MainActor [weak self, weak controller] in
+            do {
+                try await Task.sleep(for: .seconds(15))
+            } catch {
+                return
+            }
+            guard let self,
+                  self.storedSelectionOverlayController === controller,
+                  controller?.isVisible != true else { return }
+            controller?.releaseResources()
+            self.storedSelectionOverlayController = nil
+            self.selectionOverlayReleaseTask = nil
+        }
     }
 
     private func currentInputTarget() -> InputTarget? {

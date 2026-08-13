@@ -2,6 +2,45 @@ import AppKit
 import ApplicationServices
 
 enum SelectionMonitorEventPolicy {
+    static let minimumDragDistance: CGFloat = 3
+
+    private static let selectionExtendingKeyCodes: Set<UInt16> = [
+        115, // Home
+        116, // Page Up
+        119, // End
+        121, // Page Down
+        123, // Left Arrow
+        124, // Right Arrow
+        125, // Down Arrow
+        126  // Up Arrow
+    ]
+
+    static func shouldDispatchKeyUp(
+        keyCode: UInt16,
+        shiftPressed: Bool,
+        commandPressed: Bool
+    ) -> Bool {
+        (commandPressed && keyCode == 0) // Command-A
+            || (shiftPressed && selectionExtendingKeyCodes.contains(keyCode))
+    }
+
+    static func shouldInspectMouseUp(
+        dragStart: CGPoint?,
+        dragEnd: CGPoint?,
+        clickCount: Int,
+        extendsExistingSelection: Bool = false,
+        minimumDragDistance: CGFloat = minimumDragDistance
+    ) -> Bool {
+        if clickCount >= 2 || extendsExistingSelection {
+            return true
+        }
+        guard let dragStart, let dragEnd else {
+            return false
+        }
+        return hypot(dragEnd.x - dragStart.x, dragEnd.y - dragStart.y)
+            >= max(0, minimumDragDistance)
+    }
+
     static func pointIsInsideHelperWindow(
         quartzPoint: CGPoint,
         helperWindowFrames: [NSRect],
@@ -61,17 +100,27 @@ private let universalSelectionEventTapCallback: CGEventTapCallBack = {
     let monitor = Unmanaged<UniversalSelectionMonitor>
         .fromOpaque(reference)
         .takeUnretainedValue()
-    let location = event.location
     let flags = event.flags
     let keyCode = CGKeyCode(
         event.getIntegerValueField(.keyboardEventKeycode)
     )
+    if type == .keyUp,
+       !SelectionMonitorEventPolicy.shouldDispatchKeyUp(
+           keyCode: UInt16(keyCode),
+           shiftPressed: flags.contains(.maskShift),
+           commandPressed: flags.contains(.maskCommand)
+       ) {
+        return Unmanaged.passUnretained(event)
+    }
+    let location = event.location
+    let clickCount = Int(event.getIntegerValueField(.mouseEventClickState))
     DispatchQueue.main.async {
         monitor.handleEventTapEvent(
             type: type,
             location: location,
             flags: flags,
-            keyCode: keyCode
+            keyCode: keyCode,
+            clickCount: clickCount
         )
     }
     return Unmanaged.passUnretained(event)
@@ -97,13 +146,14 @@ final class UniversalSelectionMonitor {
     private var observedApplicationElement: AXUIElement?
     private var observedFocusedElement: AXUIElement?
     private var observedProcessIdentifier: pid_t?
-    private var debounceTask: Task<Void, Never>?
+    private let debounceSlot = TaskSlot<pid_t>()
     private var pendingProcessIdentifier: pid_t?
     private var pendingSourceElement: AXUIElement?
     private var pendingPointerQuartzPoint: CGPoint?
     private var pendingDragStartQuartzPoint: CGPoint?
     private var pendingDragEndQuartzPoint: CGPoint?
     private var activeDragStartQuartzPoint: CGPoint?
+    private var started = false
 
     init(
         isApplicationAllowed: @escaping ApplicationAllowed,
@@ -114,19 +164,34 @@ final class UniversalSelectionMonitor {
     }
 
     var isRunning: Bool {
-        eventTap != nil || eventMonitor != nil || accessibilityObserver != nil
+        started
+    }
+
+    func ownsAccessibilityObserver(for processIdentifier: pid_t) -> Bool {
+        started
+            && accessibilityObserver != nil
+            && observedProcessIdentifier == processIdentifier
     }
 
     func start() {
-        guard eventMonitor == nil, activationObserver == nil else {
+        guard !started else {
             return
         }
+        started = true
         AccessibilityMessagingPolicy.configureIfNeeded()
 
         if !installReadOnlyEventTap() {
             eventMonitor = NSEvent.addGlobalMonitorForEvents(
                 matching: [.leftMouseDown, .leftMouseUp, .keyUp]
             ) { [weak self] event in
+                if event.type == .keyUp,
+                   !SelectionMonitorEventPolicy.shouldDispatchKeyUp(
+                       keyCode: event.keyCode,
+                       shiftPressed: event.modifierFlags.contains(.shift),
+                       commandPressed: event.modifierFlags.contains(.command)
+                   ) {
+                    return
+                }
                 self?.handleGlobalEvent(event)
             }
         }
@@ -175,11 +240,13 @@ final class UniversalSelectionMonitor {
     }
 
     private func handleGlobalEvent(_ event: NSEvent) {
+        guard started else { return }
         handleSelectionEvent(
             type: event.type,
             pointerQuartzPoint: event.cgEvent?.location,
             modifierFlags: event.modifierFlags,
-            keyCode: event.keyCode
+            keyCode: event.keyCode,
+            clickCount: event.clickCount
         )
     }
 
@@ -187,8 +254,10 @@ final class UniversalSelectionMonitor {
         type: CGEventType,
         location: CGPoint,
         flags: CGEventFlags,
-        keyCode: CGKeyCode
+        keyCode: CGKeyCode,
+        clickCount: Int
     ) {
+        guard started else { return }
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let eventTap {
                 CGEvent.tapEnable(tap: eventTap, enable: true)
@@ -217,7 +286,8 @@ final class UniversalSelectionMonitor {
             type: eventType,
             pointerQuartzPoint: eventType == .keyUp ? nil : location,
             modifierFlags: modifierFlags,
-            keyCode: UInt16(keyCode)
+            keyCode: UInt16(keyCode),
+            clickCount: clickCount
         )
     }
 
@@ -225,45 +295,57 @@ final class UniversalSelectionMonitor {
         type: NSEvent.EventType,
         pointerQuartzPoint: CGPoint?,
         modifierFlags: NSEvent.ModifierFlags,
-        keyCode: UInt16
+        keyCode: UInt16,
+        clickCount: Int
     ) {
-            let shouldInspect: Bool
-            switch type {
-            case .leftMouseDown:
-                activeDragStartQuartzPoint = pointerQuartzPoint
-                return
-            case .leftMouseUp:
-                shouldInspect = true
-            case .keyUp:
-                shouldInspect = modifierFlags.contains(.shift)
-                    || (modifierFlags.contains(.command) && keyCode == 0)
-            default:
-                shouldInspect = false
-            }
-
-            guard shouldInspect else {
-                return
-            }
-            SelectionDiagnostics.record("global event received type=\(type.rawValue)")
-            let releasePoint = type == .leftMouseUp ? pointerQuartzPoint : nil
-            let dragStartQuartzPoint = activeDragStartQuartzPoint
+        let shouldInspect: Bool
+        let dragStartQuartzPoint: CGPoint?
+        switch type {
+        case .leftMouseDown:
+            activeDragStartQuartzPoint = pointerQuartzPoint
+            return
+        case .leftMouseUp:
+            dragStartQuartzPoint = activeDragStartQuartzPoint
             activeDragStartQuartzPoint = nil
-            if let releasePoint,
-               pointIsInsideHelperWindow(releasePoint) {
-                    // Clicking the nonactivating edge bar must not cancel the
-                    // selection inspection scheduled by the source mouse-up.
-                    SelectionDiagnostics.record("helper mouse-up ignored")
-                    return
-            }
-            guard let app = NSWorkspace.shared.frontmostApplication,
-                  isApplicationAllowed(app) else { return }
-            scheduleInspection(
-                for: app,
-                sourceElement: nil,
-                pointerQuartzPoint: releasePoint,
-                dragStartQuartzPoint: dragStartQuartzPoint,
-                dragEndQuartzPoint: releasePoint
+            shouldInspect = SelectionMonitorEventPolicy.shouldInspectMouseUp(
+                dragStart: dragStartQuartzPoint,
+                dragEnd: pointerQuartzPoint,
+                clickCount: clickCount,
+                extendsExistingSelection: modifierFlags.contains(.shift)
             )
+        case .keyUp:
+            dragStartQuartzPoint = nil
+            shouldInspect = SelectionMonitorEventPolicy.shouldDispatchKeyUp(
+                keyCode: keyCode,
+                shiftPressed: modifierFlags.contains(.shift),
+                commandPressed: modifierFlags.contains(.command)
+            )
+        default:
+            dragStartQuartzPoint = nil
+            shouldInspect = false
+        }
+
+        guard shouldInspect else {
+            return
+        }
+        SelectionDiagnostics.record("global event received type=\(type.rawValue)")
+        let releasePoint = type == .leftMouseUp ? pointerQuartzPoint : nil
+        if let releasePoint,
+           pointIsInsideHelperWindow(releasePoint) {
+                // Clicking the nonactivating edge bar must not cancel the
+                // selection inspection scheduled by the source mouse-up.
+                SelectionDiagnostics.record("helper mouse-up ignored")
+                return
+        }
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              isApplicationAllowed(app) else { return }
+        scheduleInspection(
+            for: app,
+            sourceElement: nil,
+            pointerQuartzPoint: releasePoint,
+            dragStartQuartzPoint: dragStartQuartzPoint,
+            dragEndQuartzPoint: releasePoint
+        )
     }
 
     private func pointIsInsideHelperWindow(_ quartzPoint: CGPoint) -> Bool {
@@ -285,8 +367,9 @@ final class UniversalSelectionMonitor {
     }
 
     func stop() {
-        debounceTask?.cancel()
-        debounceTask = nil
+        started = false
+        debounceSlot.cancel()
+        activeDragStartQuartzPoint = nil
         if let eventMonitor {
             NSEvent.removeMonitor(eventMonitor)
         }
@@ -324,6 +407,7 @@ final class UniversalSelectionMonitor {
         _ notification: String,
         sourceElement: AXUIElement
     ) {
+        guard started else { return }
         guard let processIdentifier = observedProcessIdentifier,
               let app = NSRunningApplication(processIdentifier: processIdentifier),
               isApplicationAllowed(app) else {
@@ -410,6 +494,16 @@ final class UniversalSelectionMonitor {
         }
         let reference = Unmanaged.passUnretained(self).toOpaque()
 
+        let nextFocusedElement = elementAttribute(
+            kAXFocusedUIElementAttribute,
+            from: observedApplicationElement
+        )
+        if let observedFocusedElement,
+           let nextFocusedElement,
+           CFEqual(observedFocusedElement, nextFocusedElement) {
+            return
+        }
+
         if let observedFocusedElement {
             _ = AXObserverRemoveNotification(
                 accessibilityObserver,
@@ -417,10 +511,7 @@ final class UniversalSelectionMonitor {
                 kAXSelectedTextChangedNotification as CFString
             )
         }
-        observedFocusedElement = elementAttribute(
-            kAXFocusedUIElementAttribute,
-            from: observedApplicationElement
-        )
+        observedFocusedElement = nextFocusedElement
         if let observedFocusedElement {
             _ = AXObserverAddNotification(
                 accessibilityObserver,
@@ -432,7 +523,27 @@ final class UniversalSelectionMonitor {
     }
 
     private func removeAccessibilityObserver() {
+        debounceSlot.cancel()
         if let accessibilityObserver {
+            if let observedFocusedElement {
+                _ = AXObserverRemoveNotification(
+                    accessibilityObserver,
+                    observedFocusedElement,
+                    kAXSelectedTextChangedNotification as CFString
+                )
+            }
+            if let observedApplicationElement {
+                _ = AXObserverRemoveNotification(
+                    accessibilityObserver,
+                    observedApplicationElement,
+                    kAXFocusedUIElementChangedNotification as CFString
+                )
+                _ = AXObserverRemoveNotification(
+                    accessibilityObserver,
+                    observedApplicationElement,
+                    kAXSelectedTextChangedNotification as CFString
+                )
+            }
             CFRunLoopRemoveSource(
                 CFRunLoopGetMain(),
                 AXObserverGetRunLoopSource(accessibilityObserver),
@@ -459,7 +570,6 @@ final class UniversalSelectionMonitor {
             }
             return
         }
-        debounceTask?.cancel()
         let processIdentifier = app.processIdentifier
         if pendingProcessIdentifier != processIdentifier {
             clearPendingInspection()
@@ -481,13 +591,18 @@ final class UniversalSelectionMonitor {
             "inspection scheduled app=\(app.bundleIdentifier ?? "unknown")"
         )
 
-        debounceTask = Task { [weak self] in
+        debounceSlot.replace(operation: {
             try? await Task.sleep(nanoseconds: 180_000_000)
-            guard !Task.isCancelled,
-                  let self,
-                  let currentApp = NSRunningApplication(processIdentifier: processIdentifier),
+            return processIdentifier
+        }, deliver: { [weak self] deliveredProcessIdentifier in
+            guard let self else { return }
+            guard let currentApp = NSRunningApplication(
+                    processIdentifier: deliveredProcessIdentifier
+                  ),
                   isApplicationAllowed(currentApp),
-                  NSWorkspace.shared.frontmostApplication?.processIdentifier == processIdentifier else {
+                  NSWorkspace.shared.frontmostApplication?.processIdentifier
+                    == deliveredProcessIdentifier else {
+                clearPendingInspection()
                 return
             }
             SelectionDiagnostics.record(
@@ -501,7 +616,7 @@ final class UniversalSelectionMonitor {
             )
             clearPendingInspection()
             handler(currentApp, hints)
-        }
+        })
     }
 
     private func clearPendingInspection() {
