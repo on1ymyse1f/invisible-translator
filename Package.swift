@@ -13,6 +13,10 @@ let package = Package(
         .executable(
             name: "ClaudePromptTranslator",
             targets: ["ClaudePromptTranslator"]
+        ),
+        .executable(
+            name: "ClaudePromptTranslatorNativeHost",
+            targets: ["ClaudePromptTranslatorNativeHost"]
         )
     ],
     dependencies: includeOptionalRuntime ? [
@@ -23,9 +27,26 @@ let package = Package(
         .executableTarget(
             name: "ClaudePromptTranslator",
             dependencies: includeOptionalRuntime ? [
+                "BrowserNativeBridgeShared",
                 .product(name: "Sparkle", package: "Sparkle"),
                 .product(name: "WhisperKit", package: "argmax-oss-swift")
-            ] : []
+            ] : ["BrowserNativeBridgeShared"],
+            swiftSettings: [
+                .unsafeFlags(["-Osize"], .when(configuration: .release))
+            ]
+        ),
+        .target(
+            name: "BrowserNativeBridgeShared",
+            swiftSettings: [
+                .unsafeFlags(["-Osize"], .when(configuration: .release))
+            ]
+        ),
+        .executableTarget(
+            name: "ClaudePromptTranslatorNativeHost",
+            dependencies: ["BrowserNativeBridgeShared"],
+            swiftSettings: [
+                .unsafeFlags(["-Osize"], .when(configuration: .release))
+            ]
         ),
         .testTarget(
             name: "ClaudePromptTranslatorTests",

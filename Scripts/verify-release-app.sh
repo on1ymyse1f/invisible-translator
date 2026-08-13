@@ -31,12 +31,21 @@ fi
 APP_PATH="$1"
 APP_NAME="ClaudePromptTranslator"
 APP_BINARY="${APP_PATH}/Contents/MacOS/${APP_NAME}"
+NATIVE_HOST_BINARY="${APP_PATH}/Contents/MacOS/ClaudePromptTranslatorNativeHost"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXPECTED_INFO_PLIST="${ROOT_DIR}/Packaging/Info.plist"
 APP_INFO_PLIST="${APP_PATH}/Contents/Info.plist"
 
-if [[ ! -d "${APP_PATH}" || ! -x "${APP_BINARY}" ]]; then
+if [[ ! -d "${APP_PATH}" || ! -x "${APP_BINARY}" || ! -x "${NATIVE_HOST_BINARY}" ]]; then
   echo "Release app or executable not found: ${APP_PATH}" >&2
+  exit 1
+fi
+
+# Distribution is Apple Silicon only. Exact equality also rejects a universal
+# binary that happens to contain arm64 alongside any unsupported architecture.
+APP_BINARY_ARCHITECTURES="$(/usr/bin/lipo -archs "${APP_BINARY}" 2>/dev/null || true)"
+if [[ "${APP_BINARY_ARCHITECTURES}" != "arm64" ]]; then
+  echo "Release verification failed: main executable must be arm64-only; found ${APP_BINARY_ARCHITECTURES:-<unknown>}." >&2
   exit 1
 fi
 
@@ -51,7 +60,8 @@ for PLIST_KEY in \
   CFBundlePackageType \
   CFBundleShortVersionString \
   CFBundleVersion \
-  LSMinimumSystemVersion; do
+  LSMinimumSystemVersion \
+  NSSpeechRecognitionUsageDescription; do
   EXPECTED_VALUE="$(/usr/libexec/PlistBuddy -c "Print :${PLIST_KEY}" "${EXPECTED_INFO_PLIST}")"
   ACTUAL_VALUE="$(/usr/libexec/PlistBuddy -c "Print :${PLIST_KEY}" "${APP_INFO_PLIST}")"
   if [[ "${ACTUAL_VALUE}" != "${EXPECTED_VALUE}" ]]; then
@@ -76,6 +86,7 @@ done < <(/usr/bin/find "${APP_PATH}/Contents" -type l -print0)
 is_allowed_embedded_code_path() {
   local candidate="$1"
   [[ "${candidate}" == "${APP_BINARY}" ]] && return 0
+  [[ "${candidate}" == "${NATIVE_HOST_BINARY}" ]] && return 0
   case "${candidate}" in
     "${APP_PATH}"/Contents/Frameworks/*.framework/*|\
     "${APP_PATH}"/Contents/PlugIns/*.appex/Contents/MacOS/*|\
@@ -96,6 +107,12 @@ while IFS= read -r -d '' EXECUTABLE_CANDIDATE; do
 done < <(/usr/bin/find "${APP_PATH}/Contents" -type f -perm -111 -print0)
 
 codesign --verify --deep --strict --verbose=2 "${APP_PATH}" >/dev/null
+codesign --verify --strict --verbose=2 "${NATIVE_HOST_BINARY}" >/dev/null
+if [[ "$(/usr/bin/lipo -archs "${APP_BINARY}" 2>/dev/null || true)" != "arm64" \
+      || "$(/usr/bin/lipo -archs "${NATIVE_HOST_BINARY}" 2>/dev/null || true)" != "arm64" ]]; then
+  echo "Release verification failed: app and native host must both be arm64-only." >&2
+  exit 1
+fi
 
 # The base app is currently single-binary, but the 1.0 distribution may add a
 # signed Sparkle framework and a signed Safari app extension. Both locations
@@ -111,14 +128,24 @@ while IFS= read -r -d '' CANDIDATE_PATH; do
   fi
 done < <(/usr/bin/find "${APP_PATH}/Contents" -type f -print0)
 
-if [[ "${MACHO_COUNT}" -lt 1 ]]; then
-  echo "Release verification failed: expected at least one Mach-O executable." >&2
+if [[ "${MACHO_COUNT}" -ne 2 ]]; then
+  echo "Release verification failed: expected exactly the app and native-host Mach-O executables; found ${MACHO_COUNT}." >&2
   exit 1
 fi
 
 SIGNING_DETAILS="$(codesign -d --verbose=4 "${APP_PATH}" 2>&1)"
-if ! /usr/bin/grep -Eq 'flags=.*\(runtime\)' <<<"${SIGNING_DETAILS}"; then
+NATIVE_HOST_SIGNING_DETAILS="$(codesign -d --verbose=4 "${NATIVE_HOST_BINARY}" 2>&1)"
+if ! /usr/bin/grep -Eq 'flags=.*runtime' <<<"${SIGNING_DETAILS}"; then
   echo "Release verification failed: hardened runtime is not enabled." >&2
+  exit 1
+fi
+if ! /usr/bin/grep -Eq 'flags=.*runtime' <<<"${NATIVE_HOST_SIGNING_DETAILS}"; then
+  echo "Release verification failed: native-host hardened runtime is not enabled." >&2
+  exit 1
+fi
+if ! /usr/bin/grep -Fq 'Identifier=local.codex.ClaudePromptTranslator.NativeHost' \
+    <<<"${NATIVE_HOST_SIGNING_DETAILS}"; then
+  echo "Release verification failed: native-host signing identifier is unexpected." >&2
   exit 1
 fi
 
@@ -131,12 +158,24 @@ if [[ "${PUBLIC_RELEASE}" == "1" ]]; then
     echo "Public Release verification failed: Developer ID Application signature required." >&2
     exit 1
   fi
+  if ! /usr/bin/grep -Fq 'Authority=Developer ID Application:' <<<"${NATIVE_HOST_SIGNING_DETAILS}"; then
+    echo "Public Release verification failed: native-host Developer ID signature required." >&2
+    exit 1
+  fi
   if ! /usr/bin/grep -Eq '^Timestamp=.+' <<<"${SIGNING_DETAILS}"; then
     echo "Public Release verification failed: secure signing timestamp required." >&2
     exit 1
   fi
+  if ! /usr/bin/grep -Eq '^Timestamp=.+' <<<"${NATIVE_HOST_SIGNING_DETAILS}"; then
+    echo "Public Release verification failed: native-host secure signing timestamp required." >&2
+    exit 1
+  fi
   if ! /usr/bin/grep -Fq "TeamIdentifier=${EXPECTED_TEAM_ID}" <<<"${SIGNING_DETAILS}"; then
     echo "Public Release verification failed: signing Team ID does not match EXPECTED_TEAM_ID." >&2
+    exit 1
+  fi
+  if ! /usr/bin/grep -Fq "TeamIdentifier=${EXPECTED_TEAM_ID}" <<<"${NATIVE_HOST_SIGNING_DETAILS}"; then
+    echo "Public Release verification failed: native-host Team ID does not match EXPECTED_TEAM_ID." >&2
     exit 1
   fi
 fi
@@ -152,9 +191,11 @@ for FORBIDDEN_MARKER in \
   'CPT_DEBUG_SELECTION' \
   'CPT_DEBUG_SELECTION_PID' \
   'CPT_DEBUG_DELIVERY' \
+  'CPT_TEST_BROWSER_NATIVE_SOCKET' \
   'translate.googleapis.com' \
   'GoogleTranslateClient'; do
-  if /usr/bin/strings "${APP_BINARY}" | /usr/bin/grep -Fq -- "${FORBIDDEN_MARKER}"; then
+  if /usr/bin/strings "${APP_BINARY}" "${NATIVE_HOST_BINARY}" \
+      | /usr/bin/grep -Fq -- "${FORBIDDEN_MARKER}"; then
     echo "Release verification failed: forbidden marker present: ${FORBIDDEN_MARKER}" >&2
     exit 1
   fi

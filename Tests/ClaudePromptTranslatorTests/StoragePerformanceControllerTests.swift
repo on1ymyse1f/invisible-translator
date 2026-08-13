@@ -51,4 +51,41 @@ final class StoragePerformanceControllerTests: XCTestCase {
         }
         XCTAssertTrue(FileManager.default.fileExists(atPath: unrelated.path))
     }
+
+    func testRejectsSymlinkedApplicationSupportParentWithoutMovingExternalModels() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StoragePerformanceTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let supportRoot = root.appendingPathComponent("Application Support", isDirectory: true)
+        let externalParent = root.appendingPathComponent("External", isDirectory: true)
+        let externalModels = externalParent.appendingPathComponent("ASRModels", isDirectory: true)
+        try FileManager.default.createDirectory(at: supportRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: externalModels, withIntermediateDirectories: true)
+        let marker = externalModels.appendingPathComponent("must-survive.cptasr")
+        try Data([0x01]).write(to: marker)
+
+        let linkedParent = supportRoot.appendingPathComponent("ClaudePromptTranslator")
+        try FileManager.default.createSymbolicLink(
+            at: linkedParent,
+            withDestinationURL: externalParent
+        )
+        let configuredModels = linkedParent.appendingPathComponent("ASRModels", isDirectory: true)
+        let inspector = StoragePerformanceInspector(
+            locations: StoragePerformanceLocations(
+                appBundleURL: root.appendingPathComponent("Translator.app"),
+                cacheDirectoryURL: root.appendingPathComponent("Caches"),
+                asrModelsDirectoryURL: configuredModels,
+                applicationSupportRootURL: supportRoot
+            )
+        )
+
+        // Snapshot runs at controller startup. It must reuse the deletion
+        // guard and report zero instead of enumerating the linked target.
+        XCTAssertEqual(inspector.snapshot().asrModelByteCount, 0)
+        XCTAssertThrowsError(try inspector.moveASRModelsToTrash()) { error in
+            XCTAssertEqual(error as? StoragePerformanceError, .modelParentIsSymbolicLink)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+    }
 }

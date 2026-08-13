@@ -181,6 +181,221 @@ final class ASRModelStoreTests: XCTestCase {
         XCTAssertNil(installedURL)
     }
 
+    func testStatusDuringDownloadDoesNotCleanUpExpiredInstalledModel() async throws {
+        let root = try makeTemporaryDirectory()
+        let privateKey = Curve25519.Signing.PrivateKey()
+        let oldPayload = Data(repeating: 0x31, count: 64 * 1_024)
+        let replacementPayload = Data(repeating: 0x32, count: 64 * 1_024)
+        let oldDescriptor = try signedDescriptor(payload: oldPayload, privateKey: privateKey)
+        let replacementDescriptor = try signedDescriptor(
+            payload: replacementPayload,
+            privateKey: privateKey
+        )
+        let verifier = try Ed25519ASRModelVerifier(
+            publicKeyRawRepresentation: privateKey.publicKey.rawRepresentation
+        )
+        let store = ASRModelStore(rootDirectory: root, verifier: verifier)
+        let installedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let oldModelURL = try await store.install(
+            oldDescriptor,
+            using: chunkedDownloadClient(payload: oldPayload),
+            now: installedAt
+        )
+        let gate = SuspendedDownloadGate()
+        let replacementClient = ASRModelDownloadClient {
+            _, destinationURL, expectedByteCount, progress in
+            await gate.markStarted()
+            await gate.waitUntilReleased()
+            try replacementPayload.write(to: destinationURL)
+            await progress(expectedByteCount)
+        }
+
+        let installTask = Task {
+            try await store.install(
+                replacementDescriptor,
+                using: replacementClient,
+                now: installedAt.addingTimeInterval(31 * 24 * 60 * 60)
+            )
+        }
+        await gate.waitUntilStarted()
+
+        let inFlightStatus = await store.status(
+            now: installedAt.addingTimeInterval(31 * 24 * 60 * 60)
+        )
+        guard case .downloading = inFlightStatus else {
+            await gate.release()
+            _ = try? await installTask.value
+            return XCTFail("Expected the replacement download to remain in progress.")
+        }
+        let cleanupResult = try await store.performAutomaticCleanup(
+            now: installedAt.addingTimeInterval(31 * 24 * 60 * 60)
+        )
+        XCTAssertFalse(cleanupResult)
+        do {
+            _ = try await store.install(
+                replacementDescriptor,
+                using: chunkedDownloadClient(payload: replacementPayload)
+            )
+            XCTFail("A concurrent second install must be rejected.")
+        } catch {
+            XCTAssertEqual(error as? ASRModelStoreError, .installationInProgress)
+        }
+        do {
+            try await store.removeInstalledModel()
+            XCTFail("Explicit removal during installation must be rejected.")
+        } catch {
+            XCTAssertEqual(error as? ASRModelStoreError, .installationInProgress)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: oldModelURL.path))
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: root.appendingPathComponent("current.json").path
+            )
+        )
+
+        await gate.release()
+        let replacementURL = try await installTask.value
+        XCTAssertTrue(FileManager.default.fileExists(atPath: replacementURL.path))
+    }
+
+    func testAutomaticCleanupDuringVerificationKeepsExpiredInstalledModel() async throws {
+        let root = try makeTemporaryDirectory()
+        let privateKey = Curve25519.Signing.PrivateKey()
+        let oldPayload = Data(repeating: 0x41, count: 32 * 1_024)
+        let replacementPayload = Data(repeating: 0x42, count: 32 * 1_024)
+        let oldDescriptor = try signedDescriptor(payload: oldPayload, privateKey: privateKey)
+        let replacementDescriptor = try signedDescriptor(
+            payload: replacementPayload,
+            privateKey: privateKey
+        )
+        let underlyingVerifier = try Ed25519ASRModelVerifier(
+            publicKeyRawRepresentation: privateKey.publicKey.rawRepresentation
+        )
+        let verifier = SuspendingASRModelVerifier(underlying: underlyingVerifier)
+        let store = ASRModelStore(rootDirectory: root, verifier: verifier)
+        let installedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let oldModelURL = try await store.install(
+            oldDescriptor,
+            using: chunkedDownloadClient(payload: oldPayload),
+            now: installedAt
+        )
+        await verifier.suspendNextVerification()
+        let replacementClient = chunkedDownloadClient(payload: replacementPayload)
+
+        let installTask = Task {
+            try await store.install(
+                replacementDescriptor,
+                using: replacementClient,
+                now: installedAt.addingTimeInterval(31 * 24 * 60 * 60)
+            )
+        }
+        await verifier.waitUntilSuspended()
+
+        guard case .verifying = await store.status() else {
+            await verifier.release()
+            _ = try? await installTask.value
+            return XCTFail("Expected replacement verification to remain in progress.")
+        }
+        let cleanupResult = try await store.performAutomaticCleanup(
+            now: installedAt.addingTimeInterval(31 * 24 * 60 * 60)
+        )
+        XCTAssertFalse(cleanupResult)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: oldModelURL.path))
+
+        await verifier.release()
+        _ = try await installTask.value
+    }
+
+    func testRootSymlinkIsRejectedWithoutFollowingOrDeletingItsTarget() async throws {
+        let container = try makeTemporaryDirectory()
+        let target = container.appendingPathComponent("outside", isDirectory: true)
+        let rootSymlink = container.appendingPathComponent("ASRModels", isDirectory: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
+        let marker = target.appendingPathComponent("must-survive.txt", isDirectory: false)
+        try Data("keep".utf8).write(to: marker)
+        try FileManager.default.createSymbolicLink(at: rootSymlink, withDestinationURL: target)
+        let privateKey = Curve25519.Signing.PrivateKey()
+        let verifier = try Ed25519ASRModelVerifier(
+            publicKeyRawRepresentation: privateKey.publicKey.rawRepresentation
+        )
+        let store = ASRModelStore(rootDirectory: rootSymlink, verifier: verifier)
+
+        do {
+            _ = try await store.performAutomaticCleanup()
+            XCTFail("A symbolic-link model root must be rejected.")
+        } catch {
+            XCTAssertEqual(error as? ASRModelStoreError, .metadataInvalid)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertEqual(try Data(contentsOf: marker), Data("keep".utf8))
+        XCTAssertEqual(
+            try FileManager.default.destinationOfSymbolicLink(atPath: rootSymlink.path),
+            target.path
+        )
+    }
+
+    func testPreexistingAppDirectorySymlinkIsRejectedBeforeExternalModelEnumeration() async throws {
+        let container = try makeTemporaryDirectory()
+        let applicationSupport = container.appendingPathComponent(
+            "Application Support",
+            isDirectory: true
+        )
+        let externalAppDirectory = container.appendingPathComponent(
+            "ExternalModelOwner",
+            isDirectory: true
+        )
+        let externalModels = externalAppDirectory.appendingPathComponent(
+            "ASRModels",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: applicationSupport,
+            withIntermediateDirectories: false
+        )
+        try FileManager.default.createDirectory(
+            at: externalModels,
+            withIntermediateDirectories: true
+        )
+        let marker = externalModels.appendingPathComponent("must-survive.cptasr")
+        try Data("external-model-must-not-be-read-or-deleted".utf8).write(to: marker)
+
+        let linkedAppDirectory = applicationSupport.appendingPathComponent(
+            "ClaudePromptTranslator",
+            isDirectory: true
+        )
+        try FileManager.default.createSymbolicLink(
+            at: linkedAppDirectory,
+            withDestinationURL: externalAppDirectory
+        )
+        let configuredRoot = linkedAppDirectory.appendingPathComponent(
+            "ASRModels",
+            isDirectory: true
+        )
+        let privateKey = Curve25519.Signing.PrivateKey()
+        let verifier = try Ed25519ASRModelVerifier(
+            publicKeyRawRepresentation: privateKey.publicKey.rawRepresentation
+        )
+
+        // The symlink already exists before store startup. The fixed lexical
+        // Application Support boundary must still reject it.
+        let store = ASRModelStore(rootDirectory: configuredRoot, verifier: verifier)
+        do {
+            _ = try await store.performAutomaticCleanup()
+            XCTFail("A preexisting app-directory symlink must be rejected.")
+        } catch {
+            XCTAssertEqual(error as? ASRModelStoreError, .metadataInvalid)
+        }
+
+        XCTAssertEqual(
+            try Data(contentsOf: marker),
+            Data("external-model-must-not-be-read-or-deleted".utf8)
+        )
+        XCTAssertEqual(
+            try FileManager.default.destinationOfSymbolicLink(atPath: linkedAppDirectory.path),
+            externalAppDirectory.path
+        )
+    }
+
     private func makeTemporaryDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("CPT-ASRModelStoreTests-\(UUID().uuidString)", isDirectory: true)
@@ -231,5 +446,88 @@ private actor DownloadInvocationRecorder {
 
     func record() {
         count += 1
+    }
+}
+
+private actor SuspendedDownloadGate {
+    private var started = false
+    private var released = false
+    private var startedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func markStarted() {
+        started = true
+        let waiters = startedWaiters
+        startedWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    func waitUntilStarted() async {
+        guard !started else { return }
+        await withCheckedContinuation { continuation in
+            startedWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilReleased() async {
+        guard !released else { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+}
+
+private actor SuspendingASRModelVerifier: ASRModelVerifying {
+    private let underlying: Ed25519ASRModelVerifier
+    private var shouldSuspendNext = false
+    private var suspended = false
+    private var released = false
+    private var suspendedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    init(underlying: Ed25519ASRModelVerifier) {
+        self.underlying = underlying
+    }
+
+    func suspendNextVerification() {
+        shouldSuspendNext = true
+        released = false
+    }
+
+    func verify(fileAt url: URL, descriptor: ASRModelDescriptor) async throws {
+        if shouldSuspendNext {
+            shouldSuspendNext = false
+            suspended = true
+            let waiters = suspendedWaiters
+            suspendedWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+            if !released {
+                await withCheckedContinuation { continuation in
+                    releaseWaiters.append(continuation)
+                }
+            }
+        }
+        try await underlying.verify(fileAt: url, descriptor: descriptor)
+    }
+
+    func waitUntilSuspended() async {
+        guard !suspended else { return }
+        await withCheckedContinuation { continuation in
+            suspendedWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
     }
 }

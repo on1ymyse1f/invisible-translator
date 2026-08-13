@@ -30,6 +30,39 @@ enum SubtitleRecognitionRuntimeMode: Equatable, Sendable {
     }
 }
 
+/// Explicit source-language choices for Apple on-device speech. Apple Speech
+/// does not provide a reliable cross-language auto-detect mode for a live
+/// audio stream, so the UI keeps this setting visible instead of guessing and
+/// silently producing low-quality subtitles.
+enum SubtitleSpeechLocale: String, CaseIterable, Sendable {
+    case system
+    case englishUS
+    case simplifiedChinese
+    case japanese
+
+    var localeIdentifier: String {
+        switch self {
+        case .system:
+            return Locale.current.identifier
+        case .englishUS:
+            return "en-US"
+        case .simplifiedChinese:
+            return "zh-CN"
+        case .japanese:
+            return "ja-JP"
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .system: return "跟随系统语言"
+        case .englishUS: return "英语"
+        case .simplifiedChinese: return "简体中文"
+        case .japanese: return "日语"
+        }
+    }
+}
+
 extension SubtitleRecognitionMode {
     /// Migrates older stored settings to the richer 1.0 runtime mode.
     var runtimeMode: SubtitleRecognitionRuntimeMode {
@@ -91,8 +124,13 @@ struct AppleOnDeviceSpeechCapability: SystemSpeechAvailabilityProviding, Sendabl
     #if canImport(Speech)
     @available(macOS 26.0, *)
     private func speechAnalyzerResolution(localeIdentifier: String) async -> SystemSpeechResolution {
+        guard let supportedLocale = await SpeechTranscriber.supportedLocale(
+            equivalentTo: Locale(identifier: localeIdentifier)
+        ) else {
+            return .systemUnsupported
+        }
         let transcriber = SpeechTranscriber(
-            locale: Locale(identifier: localeIdentifier),
+            locale: supportedLocale,
             preset: .progressiveTranscription
         )
         guard SpeechTranscriber.isAvailable else {
@@ -118,8 +156,13 @@ struct AppleOnDeviceSpeechCapability: SystemSpeechAvailabilityProviding, Sendabl
     /// model after the explicit subtitle session releases the analyzer.
     @available(macOS 26.0, *)
     func makeSpeechAnalyzer(localeIdentifier: String) async -> SpeechAnalyzer? {
+        guard let supportedLocale = await SpeechTranscriber.supportedLocale(
+            equivalentTo: Locale(identifier: localeIdentifier)
+        ) else {
+            return nil
+        }
         let transcriber = SpeechTranscriber(
-            locale: Locale(identifier: localeIdentifier),
+            locale: supportedLocale,
             preset: .progressiveTranscription
         )
         guard SpeechTranscriber.isAvailable,
@@ -327,6 +370,7 @@ actor RecognitionEnginePool {
     private let idleUnloadInterval: TimeInterval
     private var loaded: LoadedEngine?
     private var activeLeaseIdentifier: UUID?
+    private var acquisitionInProgress = false
     private var generation: UInt64 = 0
     private var scheduledUnload: Task<Void, Never>?
 
@@ -345,9 +389,14 @@ actor RecognitionEnginePool {
     }
 
     func acquire(modelID: String, now: Date = Date()) async throws -> RecognitionEngineLease {
-        guard activeLeaseIdentifier == nil else {
+        guard activeLeaseIdentifier == nil, !acquisitionInProgress else {
             throw RecognitionEnginePoolError.engineBusy
         }
+        // Reserve admission before the first await. Actors are reentrant, so
+        // checking only activeLeaseIdentifier would allow two simultaneous
+        // callers to create and overwrite a private ASR engine.
+        acquisitionInProgress = true
+        defer { acquisitionInProgress = false }
         scheduledUnload?.cancel()
         scheduledUnload = nil
 
@@ -363,7 +412,8 @@ actor RecognitionEnginePool {
             await existing.engine.unload()
             loaded = nil
         }
-        if loaded == nil {
+        let loadedDuringThisAcquire = loaded == nil
+        if loadedDuringThisAcquire {
             let engine = try await engineFactory(modelURL)
             loaded = LoadedEngine(
                 modelURL: modelURL,
@@ -373,10 +423,25 @@ actor RecognitionEnginePool {
             )
         }
 
+        do {
+            try await modelStore.markUsed(at: now)
+        } catch {
+            // Do not leave a busy lease after metadata persistence fails. A
+            // newly loaded engine is also released immediately; a reusable
+            // prior engine returns to the normal idle-unload path.
+            if loadedDuringThisAcquire, let current = loaded {
+                await current.engine.unload()
+                loaded = nil
+            } else if var current = loaded {
+                current.lastReleasedAt = now
+                loaded = current
+                scheduleIdleUnload(for: generation)
+            }
+            throw error
+        }
         generation &+= 1
         let leaseID = UUID()
         activeLeaseIdentifier = leaseID
-        try await modelStore.markUsed(at: now)
         let leaseGeneration = generation
         return RecognitionEngineLease(
             generation: leaseGeneration,
@@ -396,7 +461,7 @@ actor RecognitionEnginePool {
     }
 
     func unloadIfIdle(now: Date = Date()) async -> Bool {
-        guard activeLeaseIdentifier == nil,
+        guard activeLeaseIdentifier == nil, !acquisitionInProgress,
               let current = loaded,
               let releasedAt = current.lastReleasedAt,
               now.timeIntervalSince(releasedAt) >= idleUnloadInterval else {
@@ -412,7 +477,8 @@ actor RecognitionEnginePool {
     /// A running transcription is not interrupted; idle model memory is
     /// released immediately when macOS reports memory pressure.
     func releaseIdleEngineForMemoryPressure() async -> Bool {
-        guard activeLeaseIdentifier == nil, let current = loaded else { return false }
+        guard activeLeaseIdentifier == nil, !acquisitionInProgress,
+              let current = loaded else { return false }
         await current.engine.unload()
         loaded = nil
         scheduledUnload?.cancel()

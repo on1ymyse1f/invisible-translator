@@ -3,6 +3,16 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="ClaudePromptTranslator"
+NATIVE_HOST_NAME="ClaudePromptTranslatorNativeHost"
+
+# Establish artifact provenance before creating scratch directories or making
+# any other filesystem changes. A rejected dirty checkout must be side-effect
+# free, including leaving no orphaned mktemp directories behind.
+if [[ -n "$(git -C "${ROOT_DIR}" status --porcelain --untracked-files=normal)" ]]; then
+  echo "Refusing to package a dirty worktree; commit the exact reviewed source first so artifact provenance is truthful." >&2
+  exit 2
+fi
+
 INSTALL_APP_DIR="${INSTALL_APP_DIR:-${HOME}/Applications/${APP_NAME}.app}"
 DIST_DIR="${ROOT_DIR}/dist"
 DIST_ZIP_PATH="${DIST_DIR}/${APP_NAME}.app.zip"
@@ -11,10 +21,10 @@ LOCAL_DIST_DIR="${DIST_DIR}/local-test"
 LOCAL_ZIP_PATH="${LOCAL_DIST_DIR}/${APP_NAME}.UNNOTARIZED.app.zip"
 LOCAL_MANIFEST_PATH="${LOCAL_DIST_DIR}/${APP_NAME}.UNNOTARIZED.app.manifest.json"
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${ROOT_DIR}/Packaging/Info.plist")"
-STAGING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/${APP_NAME}.XXXXXX")"
-RELEASE_SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/${APP_NAME}-release-build.XXXXXX")"
-RELEASE_DERIVED_DATA="${RELEASE_SCRATCH}/DerivedData"
-APP_DIR="${STAGING_DIR}/${APP_NAME}.app"
+STAGING_DIR=""
+RELEASE_SCRATCH=""
+RELEASE_DERIVED_DATA=""
+APP_DIR=""
 VERIFY_SCRIPT="${ROOT_DIR}/Scripts/verify-release-app.sh"
 AUDIT_SCRIPT="${ROOT_DIR}/Scripts/audit-artifact.sh"
 MANIFEST_SCRIPT="${ROOT_DIR}/Scripts/write-release-manifest.sh"
@@ -144,9 +154,36 @@ exit(1)
 ' "${EXPECTED_BUNDLE_ID}" "${INSTALL_APP_DIR}"
 }
 
+verify_dsym_matches_binary() {
+  local binary_path="$1"
+  local dsym_path="$2"
+  local component_name="$3"
+  local binary_uuids
+  local dsym_uuids
+
+  binary_uuids="$(
+    xcrun dwarfdump --uuid "${binary_path}" \
+      | /usr/bin/awk '$1 == "UUID:" { print $2 " " $3 }' \
+      | /usr/bin/sort -u
+  )"
+  dsym_uuids="$(
+    xcrun dwarfdump --uuid "${dsym_path}" \
+      | /usr/bin/awk '$1 == "UUID:" { print $2 " " $3 }' \
+      | /usr/bin/sort -u
+  )"
+  if [[ -z "${binary_uuids}" || "${binary_uuids}" != "${dsym_uuids}" ]]; then
+    echo "Refusing to package: ${component_name} dSYM UUID does not match its unstripped Release binary." >&2
+    exit 1
+  fi
+}
+
 cleanup() {
-  rm -rf "${STAGING_DIR}"
-  rm -rf "${RELEASE_SCRATCH}"
+  if [[ -n "${STAGING_DIR}" && -d "${STAGING_DIR}" ]]; then
+    rm -rf -- "${STAGING_DIR}"
+  fi
+  if [[ -n "${RELEASE_SCRATCH}" && -d "${RELEASE_SCRATCH}" ]]; then
+    rm -rf -- "${RELEASE_SCRATCH}"
+  fi
   if [[ -n "${INSTALL_SWAP_DIR}" && -d "${INSTALL_SWAP_DIR}" \
         && "$(basename "${INSTALL_SWAP_DIR}")" == ".${APP_NAME}.install."* ]]; then
     # Never let an interrupted installer permanently delete the user's prior
@@ -172,6 +209,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Arm the cleanup trap before either allocation. If the second mktemp fails,
+# the first directory is still removed automatically.
+STAGING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/${APP_NAME}.XXXXXX")"
+RELEASE_SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/${APP_NAME}-release-build.XXXXXX")"
+RELEASE_DERIVED_DATA="${RELEASE_SCRATCH}/DerivedData"
+APP_DIR="${STAGING_DIR}/${APP_NAME}.app"
+
 validate_install_destination "${INSTALL_APP_DIR}"
 
 # The optional 0.9 runtime pulls dynamic frameworks and resources. Until the
@@ -181,11 +225,26 @@ if [[ "${CPT_INCLUDE_OPTIONAL_RUNTIME:-0}" == "1" ]]; then
   echo "Refusing to package CPT_INCLUDE_OPTIONAL_RUNTIME=1: optional framework/resource embedding is not implemented yet." >&2
   exit 2
 fi
+if [[ "${ARTIFACT_TIER}" != "core" ]]; then
+  echo "Refusing ARTIFACT_TIER=${ARTIFACT_TIER}: the full framework/resource embedding path is not implemented." >&2
+  exit 2
+fi
 
 cd "${ROOT_DIR}"
 
 if [[ -z "${DEVELOPER_DIR:-}" && -d "/Applications/Xcode.app/Contents/Developer" ]]; then
   export DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"
+fi
+
+# SpeechAnalyzer is runtime-gated to macOS 26+, while the app still runs its
+# SFSpeechRecognizer path on macOS 15-25. The source nevertheless needs the
+# macOS 26 SDK declarations at compile time, so reject an older release
+# toolchain explicitly instead of surfacing an opaque Swift compiler failure.
+SDK_VERSION="$(xcrun --sdk macosx --show-sdk-version)"
+SDK_MAJOR="${SDK_VERSION%%.*}"
+if [[ ! "${SDK_MAJOR}" =~ ^[0-9]+$ ]] || (( SDK_MAJOR < 26 )); then
+  echo "Refusing to package: macOS SDK 26 or newer is required; found ${SDK_VERSION}." >&2
+  exit 2
 fi
 
 "${ROOT_DIR}/Scripts/test.sh"
@@ -198,17 +257,36 @@ export CLANG_MODULE_CACHE_PATH="${RELEASE_DERIVED_DATA}/ModuleCache.noindex"
 swift build \
   --package-path "${ROOT_DIR}" \
   --scratch-path "${RELEASE_SCRATCH}" \
+  --arch arm64 \
   -c release \
   -Xswiftc -g
 RELEASE_BIN_DIR="$(swift build \
   --package-path "${ROOT_DIR}" \
   --scratch-path "${RELEASE_SCRATCH}" \
+  --arch arm64 \
   -c release \
   -Xswiftc -g \
   --show-bin-path)"
 EXECUTABLE_PATH="${RELEASE_BIN_DIR}/${APP_NAME}"
+NATIVE_HOST_EXECUTABLE_PATH="${RELEASE_BIN_DIR}/${NATIVE_HOST_NAME}"
 if [[ ! -x "${EXECUTABLE_PATH}" ]]; then
   echo "Release executable was not produced: ${EXECUTABLE_PATH}" >&2
+  exit 1
+fi
+if [[ ! -x "${NATIVE_HOST_EXECUTABLE_PATH}" ]]; then
+  echo "Release native-host executable was not produced: ${NATIVE_HOST_EXECUTABLE_PATH}" >&2
+  exit 1
+fi
+
+# 1.0 is intentionally Apple Silicon only. Do this before copying, stripping
+# or signing so an x86_64 or universal SwiftPM product can never become a
+# release artifact by accident.
+RELEASE_ARCHITECTURES="$(/usr/bin/lipo -archs "${EXECUTABLE_PATH}" 2>/dev/null || true)"
+NATIVE_HOST_RELEASE_ARCHITECTURES="$(/usr/bin/lipo -archs "${NATIVE_HOST_EXECUTABLE_PATH}" 2>/dev/null || true)"
+if [[ "${RELEASE_ARCHITECTURES}" != "arm64" \
+      || "${NATIVE_HOST_RELEASE_ARCHITECTURES}" != "arm64" ]]; then
+  echo "Refusing to package: main executable must be arm64-only; found ${RELEASE_ARCHITECTURES:-<unknown>}." >&2
+  echo "Native-host architectures: ${NATIVE_HOST_RELEASE_ARCHITECTURES:-<unknown>}." >&2
   exit 1
 fi
 
@@ -224,8 +302,10 @@ for DEBUG_MARKER in \
   'CPTDebugSelection' \
   'CPT_DEBUG_SELECTION' \
   'CPT_DEBUG_SELECTION_PID' \
-  'CPT_DEBUG_DELIVERY'; do
-  if /usr/bin/strings "${EXECUTABLE_PATH}" | /usr/bin/grep -Fq -- "${DEBUG_MARKER}"; then
+  'CPT_DEBUG_DELIVERY' \
+  'CPT_TEST_BROWSER_NATIVE_SOCKET'; do
+  if /usr/bin/strings "${EXECUTABLE_PATH}" "${NATIVE_HOST_EXECUTABLE_PATH}" \
+      | /usr/bin/grep -Fq -- "${DEBUG_MARKER}"; then
     echo "Refusing to package: debug marker is present in the Release binary: ${DEBUG_MARKER}" >&2
     exit 1
   fi
@@ -238,9 +318,11 @@ fi
 mkdir -p "${APP_DIR}/Contents/MacOS"
 mkdir -p "${APP_DIR}/Contents/Resources"
 cp "${EXECUTABLE_PATH}" "${APP_DIR}/Contents/MacOS/${APP_NAME}"
+cp "${NATIVE_HOST_EXECUTABLE_PATH}" "${APP_DIR}/Contents/MacOS/${NATIVE_HOST_NAME}"
 cp "${ROOT_DIR}/Packaging/Info.plist" "${APP_DIR}/Contents/Info.plist"
 cp "${ROOT_DIR}/Resources/AppIcon.icns" "${APP_DIR}/Contents/Resources/AppIcon.icns"
 chmod +x "${APP_DIR}/Contents/MacOS/${APP_NAME}"
+chmod +x "${APP_DIR}/Contents/MacOS/${NATIVE_HOST_NAME}"
 xattr -cr "${APP_DIR}" 2>/dev/null || true
 
 # Archive symbols before stripping. The dSYM never enters the app, ZIP or
@@ -250,20 +332,37 @@ GIT_SHA="$(git -C "${ROOT_DIR}" rev-parse HEAD)"
 DSYM_TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 DSYM_STAGE="${STAGING_DIR}/${APP_NAME}.app.dSYM"
 PRIVATE_DSYM_PATH="${PRIVATE_DSYM_ROOT}/${VERSION}-${GIT_SHA}-${DSYM_TIMESTAMP}/${APP_NAME}.app.dSYM"
+NATIVE_HOST_DSYM_STAGE="${STAGING_DIR}/${NATIVE_HOST_NAME}.dSYM"
+PRIVATE_NATIVE_HOST_DSYM_PATH="${PRIVATE_DSYM_ROOT}/${VERSION}-${GIT_SHA}-${DSYM_TIMESTAMP}/${NATIVE_HOST_NAME}.dSYM"
 mkdir -p "$(dirname "${PRIVATE_DSYM_PATH}")"
 xcrun dsymutil "${EXECUTABLE_PATH}" -o "${DSYM_STAGE}"
+verify_dsym_matches_binary "${EXECUTABLE_PATH}" "${DSYM_STAGE}" "main executable"
 ditto --norsrc --noextattr --noacl --noqtn "${DSYM_STAGE}" "${PRIVATE_DSYM_PATH}"
+xcrun dsymutil "${NATIVE_HOST_EXECUTABLE_PATH}" -o "${NATIVE_HOST_DSYM_STAGE}"
+verify_dsym_matches_binary \
+  "${NATIVE_HOST_EXECUTABLE_PATH}" "${NATIVE_HOST_DSYM_STAGE}" "native host"
+ditto --norsrc --noextattr --noacl --noqtn \
+  "${NATIVE_HOST_DSYM_STAGE}" "${PRIVATE_NATIVE_HOST_DSYM_PATH}"
+verify_dsym_matches_binary "${EXECUTABLE_PATH}" "${PRIVATE_DSYM_PATH}" "archived main executable"
+verify_dsym_matches_binary \
+  "${NATIVE_HOST_EXECUTABLE_PATH}" "${PRIVATE_NATIVE_HOST_DSYM_PATH}" "archived native host"
 
 # Do not strip a signed Mach-O: it would invalidate the signature and risks
 # accidentally publishing a bundle whose signature no longer represents its
 # contents. SwiftPM output is intentionally unsigned; the staged copy is
 # stripped before the first signing operation below.
 STAGED_BINARY="${APP_DIR}/Contents/MacOS/${APP_NAME}"
+STAGED_NATIVE_HOST="${APP_DIR}/Contents/MacOS/${NATIVE_HOST_NAME}"
 if codesign --verify --strict "${STAGED_BINARY}" >/dev/null 2>&1; then
   echo "Refusing to strip an already signed staged executable." >&2
   exit 1
 fi
 xcrun strip -S -x "${STAGED_BINARY}"
+if codesign --verify --strict "${STAGED_NATIVE_HOST}" >/dev/null 2>&1; then
+  echo "Refusing to strip an already signed staged native host." >&2
+  exit 1
+fi
+xcrun strip -S -x "${STAGED_NATIVE_HOST}"
 "${AUDIT_SCRIPT}" --tier "${ARTIFACT_TIER}" "${APP_DIR}"
 
 SIGN_IDENTITY="$(
@@ -278,14 +377,23 @@ SIGN_IDENTITY="$(
 if [[ -n "${SIGN_IDENTITY}" ]]; then
   if [[ "${SIGN_IDENTITY}" == Developer\ ID\ Application:* ]]; then
     echo "Signing with an available Developer ID Application identity."
-    codesign --force --deep --timestamp --options runtime --sign "${SIGN_IDENTITY}" "${APP_DIR}" >/dev/null
+    codesign --force --timestamp --options runtime \
+      --identifier local.codex.ClaudePromptTranslator.NativeHost \
+      --sign "${SIGN_IDENTITY}" "${STAGED_NATIVE_HOST}" >/dev/null
+    codesign --force --timestamp --options runtime --sign "${SIGN_IDENTITY}" "${APP_DIR}" >/dev/null
   else
     echo "Signing with an available local development identity."
-    codesign --force --deep --timestamp=none --options runtime --sign "${SIGN_IDENTITY}" "${APP_DIR}" >/dev/null
+    codesign --force --timestamp=none --options runtime \
+      --identifier local.codex.ClaudePromptTranslator.NativeHost \
+      --sign "${SIGN_IDENTITY}" "${STAGED_NATIVE_HOST}" >/dev/null
+    codesign --force --timestamp=none --options runtime --sign "${SIGN_IDENTITY}" "${APP_DIR}" >/dev/null
   fi
 else
   echo "Signing ad hoc; Accessibility permission may need to be re-granted after rebuilds."
-  codesign --force --deep --options runtime --sign - "${APP_DIR}" >/dev/null
+  codesign --force --options runtime \
+    --identifier local.codex.ClaudePromptTranslator.NativeHost \
+    --sign - "${STAGED_NATIVE_HOST}" >/dev/null
+  codesign --force --options runtime --sign - "${APP_DIR}" >/dev/null
 fi
 
 xattr -cr "${APP_DIR}" 2>/dev/null || true
@@ -414,8 +522,11 @@ ditto -x -k "${FINAL_ZIP_PATH}" "${DIST_VERIFY_DIR}"
 
 INSTALL_SHA="$(shasum -a 256 "${INSTALL_APP_DIR}/Contents/MacOS/${APP_NAME}" | awk '{print $1}')"
 ARCHIVE_SHA="$(shasum -a 256 "${DIST_VERIFY_DIR}/${APP_NAME}.app/Contents/MacOS/${APP_NAME}" | awk '{print $1}')"
-if [[ "${INSTALL_SHA}" != "${ARCHIVE_SHA}" ]]; then
-  echo "Refusing to package: ZIP executable differs from installed Release." >&2
+INSTALL_NATIVE_HOST_SHA="$(shasum -a 256 "${INSTALL_APP_DIR}/Contents/MacOS/${NATIVE_HOST_NAME}" | awk '{print $1}')"
+ARCHIVE_NATIVE_HOST_SHA="$(shasum -a 256 "${DIST_VERIFY_DIR}/${APP_NAME}.app/Contents/MacOS/${NATIVE_HOST_NAME}" | awk '{print $1}')"
+if [[ "${INSTALL_SHA}" != "${ARCHIVE_SHA}" \
+      || "${INSTALL_NATIVE_HOST_SHA}" != "${ARCHIVE_NATIVE_HOST_SHA}" ]]; then
+  echo "Refusing to package: ZIP executable or native host differs from installed Release." >&2
   exit 1
 fi
 

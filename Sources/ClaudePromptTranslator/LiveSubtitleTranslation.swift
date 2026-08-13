@@ -92,7 +92,7 @@ struct SubtitleCueProcessor: Sendable {
         self.duplicateSimilarityThreshold = duplicateSimilarityThreshold
     }
 
-    mutating func observe(_ rawText: String) -> String? {
+    mutating func observe(_ rawText: String, isFinal: Bool = false) -> String? {
         guard let cue = SubtitleSentenceFormatter.normalizedCue(from: rawText) else {
             pendingText = ""
             pendingFrames = 0
@@ -110,7 +110,7 @@ struct SubtitleCueProcessor: Sendable {
             pendingFrames = 1
         }
 
-        guard pendingFrames >= 2,
+        guard (pendingFrames >= 2 || isFinal),
               lastEmittedText.isEmpty
                 || SubtitleTextSimilarity.score(pendingText, lastEmittedText)
                     < duplicateSimilarityThreshold else {

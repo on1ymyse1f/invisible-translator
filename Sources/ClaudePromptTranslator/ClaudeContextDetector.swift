@@ -1,7 +1,24 @@
 import AppKit
 import ApplicationServices
 
-struct ClaudeContextDetector {
+enum AIWebURLScanPolicy {
+    static let interval: TimeInterval = 3
+
+    static func shouldReuse(
+        cachedProcessIdentifier: pid_t,
+        currentProcessIdentifier: pid_t,
+        cachedWindowIdentity: CFHashCode,
+        currentWindowIdentity: CFHashCode,
+        expiresAt: Date,
+        now: Date
+    ) -> Bool {
+        cachedProcessIdentifier == currentProcessIdentifier
+            && cachedWindowIdentity == currentWindowIdentity
+            && now < expiresAt
+    }
+}
+
+final class ClaudeContextDetector {
     private static let excludedBundleIdentifiers: Set<String> = [
         "com.openai.codex"
     ]
@@ -11,13 +28,13 @@ struct ClaudeContextDetector {
         return excludedBundleIdentifiers.contains(bundleIdentifier.lowercased())
     }
 
-    private let browserBundleIdentifiers: Set<String> = [
-        "com.apple.Safari",
-        "com.google.Chrome",
-        "com.google.Chrome.canary",
-        "company.thebrowser.Browser",
+    private static let browserBundleIdentifiers: Set<String> = [
+        "com.apple.safari",
+        "com.google.chrome",
+        "com.google.chrome.canary",
+        "company.thebrowser.browser",
         "com.microsoft.edgemac",
-        "com.brave.Browser",
+        "com.brave.browser",
         "com.openai.atlas",
         "org.mozilla.firefox"
     ]
@@ -29,6 +46,14 @@ struct ClaudeContextDetector {
         "com.microsoft.copilot",
         "com.openai.chat",
         "local.codex.chatgptsyntheticharness"
+    ]
+
+    private static let knownWebBackedDesktopAIBundleIdentifiers: Set<String> = [
+        "ai.perplexity.mac",
+        "com.anthropic.claudefordesktop",
+        "com.google.gemini",
+        "com.microsoft.copilot",
+        "com.openai.chat"
     ]
 
     private static let knownDesktopAIApplicationNames: Set<String> = [
@@ -53,6 +78,16 @@ struct ClaudeContextDetector {
         "qianwen.com"
     ]
 
+    private struct CachedFrontmostWebURL {
+        let processIdentifier: pid_t
+        let windowIdentity: CFHashCode
+        let windowElement: AXUIElement
+        let expiresAt: Date
+        let url: URL?
+    }
+
+    private var cachedFrontmostWebURL: CachedFrontmostWebURL?
+
     func isClaudeContext(_ app: NSRunningApplication) -> Bool {
         let name = app.localizedName?.lowercased() ?? ""
         let bundleIdentifier = app.bundleIdentifier?.lowercased() ?? ""
@@ -65,7 +100,7 @@ struct ClaudeContextDetector {
             return true
         }
 
-        guard isSupportedBrowser(name: name, bundleIdentifier: bundleIdentifier) else {
+        guard Self.isSupportedBrowserIdentity(name: name, bundleIdentifier: bundleIdentifier) else {
             return false
         }
 
@@ -86,7 +121,7 @@ struct ClaudeContextDetector {
             return true
         }
 
-        guard isSupportedBrowser(name: name, bundleIdentifier: bundleIdentifier) else {
+        guard Self.isSupportedBrowserIdentity(name: name, bundleIdentifier: bundleIdentifier) else {
             return false
         }
 
@@ -123,8 +158,8 @@ struct ClaudeContextDetector {
         return false
     }
 
-    private func isSupportedBrowser(name: String, bundleIdentifier: String) -> Bool {
-        if browserBundleIdentifiers.contains(bundleIdentifier) {
+    static func isSupportedBrowserIdentity(name: String, bundleIdentifier: String) -> Bool {
+        if browserBundleIdentifiers.contains(bundleIdentifier.lowercased()) {
             return true
         }
 
@@ -136,6 +171,34 @@ struct ClaudeContextDetector {
             "brave",
             "firefox"
         ].contains { name.contains($0) }
+    }
+
+    func requiresCompatibilityPolling(_ app: NSRunningApplication) -> Bool {
+        Self.requiresCompatibilityPolling(
+            name: app.localizedName ?? "",
+            bundleIdentifier: app.bundleIdentifier ?? ""
+        )
+    }
+
+    static func requiresCompatibilityPolling(
+        name: String,
+        bundleIdentifier: String
+    ) -> Bool {
+        let normalizedName = name.lowercased()
+        let normalizedBundleIdentifier = bundleIdentifier.lowercased()
+        if isSupportedBrowserIdentity(
+            name: normalizedName,
+            bundleIdentifier: normalizedBundleIdentifier
+        ) {
+            return true
+        }
+        if knownWebBackedDesktopAIBundleIdentifiers.contains(normalizedBundleIdentifier) {
+            return true
+        }
+        // Name-only desktop identities have no stable implementation contract;
+        // retain compatibility polling until a concrete native bundle is known.
+        return normalizedBundleIdentifier.isEmpty
+            && knownDesktopAIApplicationNames.contains(normalizedName)
     }
 
     private func frontmostWebURL(for app: NSRunningApplication) -> URL? {
@@ -161,6 +224,21 @@ struct ClaudeContextDetector {
             return nil
         }
         let windowElement = windowRef as! AXUIElement
+        let windowIdentity = CFHash(windowElement)
+        let now = Date()
+        if let cachedFrontmostWebURL,
+           AIWebURLScanPolicy.shouldReuse(
+            cachedProcessIdentifier: cachedFrontmostWebURL.processIdentifier,
+            currentProcessIdentifier: app.processIdentifier,
+            cachedWindowIdentity: cachedFrontmostWebURL.windowIdentity,
+            currentWindowIdentity: windowIdentity,
+            expiresAt: cachedFrontmostWebURL.expiresAt,
+            now: now
+           ),
+           CFEqual(cachedFrontmostWebURL.windowElement, windowElement) {
+            return cachedFrontmostWebURL.url
+        }
+
         var queue: [(AXUIElement, Int)] = [(windowElement, 0)]
         var visited = 0
         while !queue.isEmpty, visited < 500 {
@@ -168,11 +246,25 @@ struct ClaudeContextDetector {
             visited += 1
             if stringAttribute(kAXRoleAttribute, from: element) == "AXWebArea",
                let url = urlAttribute(kAXURLAttribute, from: element) {
+                cachedFrontmostWebURL = CachedFrontmostWebURL(
+                    processIdentifier: app.processIdentifier,
+                    windowIdentity: windowIdentity,
+                    windowElement: windowElement,
+                    expiresAt: now.addingTimeInterval(AIWebURLScanPolicy.interval),
+                    url: url
+                )
                 return url
             }
             guard depth < 12 else { continue }
             queue.append(contentsOf: childrenAttribute(element).map { ($0, depth + 1) })
         }
+        cachedFrontmostWebURL = CachedFrontmostWebURL(
+            processIdentifier: app.processIdentifier,
+            windowIdentity: windowIdentity,
+            windowElement: windowElement,
+            expiresAt: now.addingTimeInterval(AIWebURLScanPolicy.interval),
+            url: nil
+        )
         return nil
     }
 

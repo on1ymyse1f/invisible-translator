@@ -85,6 +85,136 @@ final class TranslationClientTests: XCTestCase {
         )
     }
 
+    func testAIContextRefreshPolicyUsesLongWatchdogOnlyForProvenNativeNotifications() {
+        XCTAssertEqual(
+            AIContextRefreshPolicy.notificationReliability(
+                registrationComplete: true,
+                observedContentNotification: false
+            ),
+            .unproven
+        )
+        XCTAssertEqual(
+            AIContextRefreshPolicy.notificationReliability(
+                registrationComplete: true,
+                observedContentNotification: true
+            ),
+            .reliable
+        )
+        XCTAssertEqual(
+            AIContextRefreshPolicy.notificationReliability(
+                registrationComplete: false,
+                observedContentNotification: true
+            ),
+            .unproven
+        )
+        XCTAssertEqual(
+            AIContextRefreshPolicy.watchdogInterval(
+                hasActiveAIContext: true,
+                notificationReliability: .reliable,
+                requiresCompatibilityPolling: false
+            ),
+            15
+        )
+        XCTAssertEqual(
+            AIContextRefreshPolicy.responseScanInterval(
+                notificationReliability: .reliable,
+                requiresCompatibilityPolling: false
+            ),
+            15
+        )
+        XCTAssertEqual(
+            AIContextRefreshPolicy.watchdogInterval(
+                hasActiveAIContext: true,
+                notificationReliability: .unproven,
+                requiresCompatibilityPolling: false
+            ),
+            2
+        )
+        XCTAssertEqual(
+            AIContextRefreshPolicy.responseScanInterval(
+                notificationReliability: .reliable,
+                requiresCompatibilityPolling: true
+            ),
+            2
+        )
+        XCTAssertEqual(
+            AIContextRefreshPolicy.watchdogInterval(
+                hasActiveAIContext: false,
+                notificationReliability: .unproven,
+                requiresCompatibilityPolling: true
+            ),
+            15
+        )
+    }
+
+    func testAIWebURLScanPolicyCachesOnlySameWindowForThreeSeconds() {
+        let now = Date(timeIntervalSince1970: 10)
+        XCTAssertEqual(AIWebURLScanPolicy.interval, 3)
+        XCTAssertTrue(
+            AIWebURLScanPolicy.shouldReuse(
+                cachedProcessIdentifier: 42,
+                currentProcessIdentifier: 42,
+                cachedWindowIdentity: 7,
+                currentWindowIdentity: 7,
+                expiresAt: now.addingTimeInterval(3),
+                now: now
+            )
+        )
+        XCTAssertFalse(
+            AIWebURLScanPolicy.shouldReuse(
+                cachedProcessIdentifier: 42,
+                currentProcessIdentifier: 42,
+                cachedWindowIdentity: 7,
+                currentWindowIdentity: 8,
+                expiresAt: now.addingTimeInterval(3),
+                now: now
+            )
+        )
+        XCTAssertFalse(
+            AIWebURLScanPolicy.shouldReuse(
+                cachedProcessIdentifier: 42,
+                currentProcessIdentifier: 42,
+                cachedWindowIdentity: 7,
+                currentWindowIdentity: 7,
+                expiresAt: now,
+                now: now
+            )
+        )
+    }
+
+    func testCompatibilityPollingIsLimitedToWebBackedOrUnidentifiedDesktopHosts() {
+        XCTAssertTrue(
+            ClaudeContextDetector.requiresCompatibilityPolling(
+                name: "Safari",
+                bundleIdentifier: "com.apple.Safari"
+            )
+        )
+        XCTAssertTrue(
+            ClaudeContextDetector.requiresCompatibilityPolling(
+                name: "Claude",
+                bundleIdentifier: "com.anthropic.claudefordesktop"
+            )
+        )
+        XCTAssertTrue(
+            ClaudeContextDetector.requiresCompatibilityPolling(
+                name: "Claude",
+                bundleIdentifier: ""
+            )
+        )
+        XCTAssertTrue(
+            ClaudeContextDetector.requiresCompatibilityPolling(
+                name: "ChatGPT",
+                bundleIdentifier: "com.openai.chat"
+            )
+        )
+        XCTAssertFalse(
+            ClaudeContextDetector.requiresCompatibilityPolling(
+                name: "Synthetic Native AI",
+                bundleIdentifier: "local.codex.chatgptsyntheticharness"
+            )
+        )
+    }
+
     func testUniversalSelectionLanguageRoutingIsBidirectional() {
         let chinese = SelectionLanguageRouter.route(for: "这是一个跨应用选区翻译测试。")
         let english = SelectionLanguageRouter.route(
@@ -1422,6 +1552,19 @@ final class TranslationClientTests: XCTestCase {
         XCTAssertEqual(cache.translation(for: "Third response"), "丙")
     }
 
+    func testResponseTranslationCacheRejectsOversizedLegacyEntries() {
+        var cache = ResponseTranslationCache(
+            capacity: 4,
+            timeToLive: 180,
+            maximumByteCount: 8
+        )
+        cache.insert("123456789", for: "Oversized response")
+        XCTAssertNil(cache.translation(for: "Oversized response"))
+
+        cache.insert("短", for: "Small response")
+        XCTAssertEqual(cache.translation(for: "Small response"), "短")
+    }
+
     func testAutomaticResponseOCRIsNeverImplicitlyAuthorized() {
         XCTAssertFalse(
             ResponseCapturePrivacyPolicy.allowsOCR(
@@ -1884,6 +2027,27 @@ final class TranslationClientTests: XCTestCase {
         )
         XCTAssertFalse(
             ClaudeContextDetector.isExcludedAIApp(bundleIdentifier: "com.anthropic.claudefordesktop")
+        )
+    }
+
+    func testSupportedBrowserBundleIdentifiersAreCaseInsensitive() {
+        XCTAssertTrue(
+            ClaudeContextDetector.isSupportedBrowserIdentity(
+                name: "Atlas",
+                bundleIdentifier: "com.openai.atlas"
+            )
+        )
+        XCTAssertTrue(
+            ClaudeContextDetector.isSupportedBrowserIdentity(
+                name: "Unknown",
+                bundleIdentifier: "COM.GOOGLE.CHROME"
+            )
+        )
+        XCTAssertFalse(
+            ClaudeContextDetector.isSupportedBrowserIdentity(
+                name: "Notes",
+                bundleIdentifier: "com.apple.Notes"
+            )
         )
     }
 

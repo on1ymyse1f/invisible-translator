@@ -21,6 +21,8 @@
     hoverTimer: 0,
     lastHoverTarget: null,
     records: new Map(),
+    pendingRequests: new Map(),
+    generation: 0,
     hoverHandler: null
   };
 
@@ -40,8 +42,7 @@
   function isIgnoredTextNode(node) {
     const parent = node.parentElement;
     if (!parent) return true;
-    if (parent.closest("[data-invisible-translation], [data-invisible-translator-source]")) return true;
-    return /^(SCRIPT|STYLE|NOSCRIPT|TEXTAREA|INPUT|CODE|PRE|SVG)$/i.test(parent.tagName);
+    return Boolean(parent.closest(core.ignoredContainerSelector));
   }
 
   function candidateTextNodes(root) {
@@ -52,8 +53,9 @@
     for (const selector of rule.textSelectors) {
       root.querySelectorAll(selector).forEach((element) => containers.push(element));
     }
-    const scanRoots = containers.length ? containers : [root]; // generic fallback, still within content root
-    for (const scanRoot of scanRoots) {
+    // Fail closed when a known site's message/content rule no longer matches.
+    // Falling back to the whole root can include an unsent composer draft.
+    for (const scanRoot of containers) {
       const walker = document.createTreeWalker(scanRoot, NodeFilter.SHOW_TEXT);
       let node;
       while ((node = walker.nextNode())) {
@@ -87,6 +89,20 @@
       if (oldest === undefined) break;
       state.records.delete(oldest);
     }
+    for (const [requestId, record] of state.pendingRequests) {
+      if (now - record.createdAt > pendingRecordTTL || record.generation !== state.generation) {
+        state.pendingRequests.delete(requestId);
+        for (const [itemId, itemRecord] of state.records) {
+          if (itemRecord.requestId === requestId) state.records.delete(itemId);
+        }
+      }
+    }
+  }
+
+  function invalidateRequests() {
+    state.generation += 1;
+    state.records.clear();
+    state.pendingRequests.clear();
   }
 
   function requestTranslation(kind, items) {
@@ -97,17 +113,40 @@
     const requestId = makeRequestId(kind);
     const createdAt = Date.now();
     pruneRecords(createdAt);
+    const origin = core.allowedOrigin(location.href);
+    const message = {
+      type: "translationRequest",
+      version: core.protocolVersion,
+      requestId,
+      origin,
+      kind,
+      payload: { kind, items: packed.accepted.map(({ id, text }) => ({ id, text })) }
+    };
+    // The content side enforces the same shape/budget that the worker repeats
+    // before data reaches native messaging.
+    if (!core.validateTranslationRequest(message)) return;
+    state.pendingRequests.set(requestId, { kind, origin, createdAt, generation: state.generation });
     if (kind !== "subtitle") {
       for (const item of packed.accepted) {
-        state.records.set(item.id, { ...item, createdAt, kind });
+        state.records.set(item.id, { ...item, createdAt, kind, requestId, generation: state.generation });
       }
       pruneRecords(createdAt);
     }
-    const delivery = api.runtime.sendMessage({
-      type: "translationRequest",
-      requestId,
-      payload: { kind, items: packed.accepted.map(({ id, text }) => ({ id, text })), settings: { hideOriginal: state.hideOriginal } }
-    });
+    const delivery = api.runtime.sendMessage(message);
+    if (delivery && typeof delivery.catch === "function") delivery.catch(() => undefined);
+  }
+
+  function requestSettingsBootstrap() {
+    const message = {
+      type: "settingsQuery",
+      version: core.protocolVersion,
+      origin: core.allowedOrigin(location.href)
+    };
+    // This message contains no page text, selection, title, URL path or DOM
+    // identifier. It can only ask the native app about the current exact
+    // allow-listed origin.
+    if (!core.validateSettingsQuery(message)) return;
+    const delivery = api.runtime.sendMessage(message);
     if (delivery && typeof delivery.catch === "function") delivery.catch(() => undefined);
   }
 
@@ -190,7 +229,15 @@
   }
 
   function handleNativeResult(message) {
-    if (message.error || !message.result) return;
+    if (!message || message.type !== "nativeTranslationResult" ||
+      message.version !== core.protocolVersion || !core.validateTranslationResponse(message.result) ||
+      message.requestId !== message.result.requestId || message.origin !== message.result.origin ||
+      message.kind !== message.result.kind) return;
+    const request = state.pendingRequests.get(message.requestId);
+    if (!request || request.generation !== state.generation ||
+      request.origin !== message.origin || request.kind !== message.kind ||
+      Date.now() - request.createdAt > pendingRecordTTL) return;
+    state.pendingRequests.delete(message.requestId);
     const result = message.result;
     if (result.kind === "subtitle") {
       showSubtitle(result);
@@ -199,6 +246,7 @@
     for (const item of result.items || []) {
       const record = state.records.get(item.id);
       state.records.delete(item.id);
+      if (!record || record.requestId !== message.requestId || record.generation !== state.generation) continue;
       if (result.kind === "hover") showHover(record, item.translation);
       else applyTextTranslation(record, item.translation);
     }
@@ -216,6 +264,15 @@
 
   function setSettings(settings) {
     const next = settings || {};
+    const previous = {
+      autoMode: state.autoMode,
+      hoverMode: state.hoverMode
+    };
+    if (core.settingsRevokeAccess(previous, next)) {
+      // A late native result must never modify the page after the user or App
+      // revokes this origin's automatic/hover permission.
+      invalidateRequests();
+    }
     state.autoMode = Boolean(next.autoMode);
     state.hideOriginal = Boolean(next.hideOriginal);
     if (state.autoMode) startObserver();
@@ -239,10 +296,11 @@
     if (state.hoverHandler) return;
     state.hoverHandler = (event) => {
       const target = event.target instanceof Element ? event.target : null;
-      if (!target || target === state.lastHoverTarget) return;
+      if (core.hasIgnoredHoverBoundary(target) || target === state.lastHoverTarget) return;
       state.lastHoverTarget = target;
       window.clearTimeout(state.hoverTimer);
       state.hoverTimer = window.setTimeout(() => {
+        if (!target.isConnected || core.hasIgnoredHoverBoundary(target)) return;
         const text = (target.textContent || "").replace(/\s+/g, " ").trim();
         if (text.length >= 2 && core.utf8ByteLength(text) <= core.maxBatchBytes) {
           requestTranslation("hover", [{ id: makeRequestId("hover"), text, target }]);
@@ -264,13 +322,16 @@
 
   api.runtime.onMessage.addListener((message) => {
     if (message?.type === "nativeTranslationResult") handleNativeResult(message);
-    if (message?.type === "extensionSettings") setSettings(message.settings);
+    if (message?.type === "extensionSettings" && core.validateExtensionSettings(message) &&
+      message.origin === core.allowedOrigin(location.href)) setSettings(message.settings);
   });
   window.addEventListener("popstate", () => {
+    invalidateRequests();
     state.observer?.disconnect();
     state.observer = null;
     if (state.autoMode) startObserver();
   });
   // The native app explicitly enables auto/hover mode for each user-authorised
   // domain. Until then this script does not scan, observe, or send content.
+  requestSettingsBootstrap();
 })();

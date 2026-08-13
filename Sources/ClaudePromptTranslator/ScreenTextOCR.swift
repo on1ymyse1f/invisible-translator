@@ -1,5 +1,7 @@
 import AppKit
 import CoreGraphics
+import CoreMedia
+import CoreVideo
 import ScreenCaptureKit
 import Vision
 
@@ -262,13 +264,45 @@ enum ScreenTextOCRRecognizer {
         in image: CGImage,
         configuration: VisionTextRecognitionConfiguration
     ) throws -> ScreenTextOCRResult {
-        let automatic = perform(
-            in: image,
-            recognitionLevel: .fast,
-            usesLanguageCorrection: false,
-            recognitionLanguages: nil,
-            configuration: configuration
-        )
+        try recognize(configuration: configuration) { level, correction, languages in
+            perform(
+                in: image,
+                recognitionLevel: level,
+                usesLanguageCorrection: correction,
+                recognitionLanguages: languages,
+                configuration: configuration
+            )
+        }
+    }
+
+    /// Continuous subtitle capture keeps pixels in their ScreenCaptureKit
+    /// surface and hands them directly to Vision. No CGImage is created on this
+    /// path.
+    static func recognize(
+        in pixelBuffer: CVPixelBuffer,
+        profile: VisionTextRecognitionProfile = .liveSubtitle
+    ) throws -> ScreenTextOCRResult {
+        let configuration = profile.configuration
+        return try recognize(configuration: configuration) { level, correction, languages in
+            perform(
+                in: pixelBuffer,
+                recognitionLevel: level,
+                usesLanguageCorrection: correction,
+                recognitionLanguages: languages,
+                configuration: configuration
+            )
+        }
+    }
+
+    private static func recognize(
+        configuration: VisionTextRecognitionConfiguration,
+        performPass: (
+            _ recognitionLevel: VNRequestTextRecognitionLevel,
+            _ usesLanguageCorrection: Bool,
+            _ recognitionLanguages: [String]?
+        ) -> OCRPass
+    ) throws -> ScreenTextOCRResult {
+        let automatic = performPass(.fast, false, nil)
         let best: OCRPass
         if configuration.shouldRunAccuratePass(
             lineCount: automatic.lines.count,
@@ -278,14 +312,12 @@ enum ScreenTextOCRRecognizer {
             let detectedIdentifier = SelectionLanguageRouter.detectedLanguageIdentifier(
                 in: automatic.lines.map(\.text).joined(separator: "\n")
             )
-            let multilingual = perform(
-                in: image,
-                recognitionLevel: .accurate,
-                usesLanguageCorrection: true,
-                recognitionLanguages: automatic.lines.isEmpty
+            let multilingual = performPass(
+                .accurate,
+                true,
+                automatic.lines.isEmpty
                     ? nil
-                    : preferredRecognitionLanguages(for: detectedIdentifier),
-                configuration: configuration
+                    : preferredRecognitionLanguages(for: detectedIdentifier)
             )
             best = score(multilingual) > score(automatic) ? multilingual : automatic
         } else {
@@ -346,6 +378,40 @@ enum ScreenTextOCRRecognizer {
         recognitionLanguages: [String]?,
         configuration: VisionTextRecognitionConfiguration
     ) -> OCRPass {
+        perform(
+            recognitionLevel: recognitionLevel,
+            usesLanguageCorrection: usesLanguageCorrection,
+            recognitionLanguages: recognitionLanguages,
+            configuration: configuration
+        ) { request in
+            try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+        }
+    }
+
+    private static func perform(
+        in pixelBuffer: CVPixelBuffer,
+        recognitionLevel: VNRequestTextRecognitionLevel,
+        usesLanguageCorrection: Bool,
+        recognitionLanguages: [String]?,
+        configuration: VisionTextRecognitionConfiguration
+    ) -> OCRPass {
+        perform(
+            recognitionLevel: recognitionLevel,
+            usesLanguageCorrection: usesLanguageCorrection,
+            recognitionLanguages: recognitionLanguages,
+            configuration: configuration
+        ) { request in
+            try VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:]).perform([request])
+        }
+    }
+
+    private static func perform(
+        recognitionLevel: VNRequestTextRecognitionLevel,
+        usesLanguageCorrection: Bool,
+        recognitionLanguages: [String]?,
+        configuration: VisionTextRecognitionConfiguration,
+        requestHandler: (VNRecognizeTextRequest) throws -> Void
+    ) -> OCRPass {
         autoreleasepool {
             let request = VNRecognizeTextRequest()
             request.recognitionLevel = recognitionLevel
@@ -359,7 +425,7 @@ enum ScreenTextOCRRecognizer {
             }
 
             do {
-                try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+                try requestHandler(request)
             } catch {
                 return OCRPass(lines: [])
             }
@@ -493,13 +559,20 @@ struct ScreenRegionOCRService {
             guard authorizationCheck() else { throw CancellationError() }
             let sendableImage = SendableCGImage(value: image)
             do {
-                let result = try await Task.detached(priority: .userInitiated) {
+                let recognitionTask = Task.detached(priority: .userInitiated) {
                     try Task.checkCancellation()
                     return try ScreenTextOCRRecognizer.recognize(
                         in: sendableImage.value,
                         configuration: recognitionConfiguration
                     )
-                }.value
+                }
+                let result = try await withTaskCancellationHandler {
+                    try await recognitionTask.value
+                } onCancel: {
+                    recognitionTask.cancel()
+                }
+                try Task.checkCancellation()
+                guard authorizationCheck() else { throw CancellationError() }
                 results.append(result)
             } catch ScreenTextOCRError.noTextRecognized {
                 continue
@@ -543,20 +616,61 @@ struct ScreenRegionOCRService {
         )
     }
 
-    /// Captures one privacy-gated frame for the live subtitle producer. The
-    /// returned image has already been reduced to the subtitle pixel budget and
-    /// contains only windows owned by `sourceApplication`.
-    func captureSubtitleFrame(
+    /// Starts the continuous, source-App-only subtitle capture path. The
+    /// expensive shareable-content lookup and filter creation happen once per
+    /// user-approved region, not once per frame.
+    func startSubtitleCaptureStream(
         region: ScreenRegionSelection,
         sourceApplication: NSRunningApplication,
         authorizationCheck: @MainActor () -> Bool
-    ) async throws -> CGImage {
-        try await capture(
+    ) async throws -> SubtitleCaptureStream {
+        let context = try await prepareCaptureContext(
             region: region,
             sourceApplication: sourceApplication,
-            recognitionConfiguration: VisionTextRecognitionProfile.liveSubtitle.configuration,
             authorizationCheck: authorizationCheck
         )
+        // `SCShareableContent` is asynchronous; do not let a permission or
+        // privacy-policy change during that await create a stream afterwards.
+        guard authorizationCheck() else { throw CancellationError() }
+        let sourceRect = context.sourceRect
+        let requestedWidth = max(Int(sourceRect.width * context.pixelScale), 1)
+        let requestedHeight = max(Int(sourceRect.height * context.pixelScale), 1)
+        let captureSize = VisionTextRecognitionProfile.liveSubtitle.configuration.fittedPixelSize(
+            width: requestedWidth,
+            height: requestedHeight
+        )
+        let configuration = SCStreamConfiguration()
+        configuration.sourceRect = sourceRect
+        configuration.width = captureSize.width
+        configuration.height = captureSize.height
+        configuration.showsCursor = false
+        configuration.queueDepth = 2
+        // The subtitle fingerprint sampler uses a single packed plane; lock
+        // the stream to the same well-supported format Vision accepts.
+        configuration.pixelFormat = kCVPixelFormatType_32BGRA
+        // The stream may receive more display callbacks, but the consumer only
+        // takes its latest slot at the adaptive 4/2 fps cadence.
+        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 4)
+
+        let stream = try SubtitleCaptureStream(
+            filter: context.filter,
+            configuration: configuration
+        )
+        guard authorizationCheck() else {
+            await stream.stop()
+            throw CancellationError()
+        }
+        do {
+            try await stream.start()
+            guard authorizationCheck() else {
+                await stream.stop()
+                throw CancellationError()
+            }
+            return stream
+        } catch {
+            await stream.stop()
+            throw error
+        }
     }
 
     private func capture(
@@ -598,6 +712,9 @@ struct ScreenRegionOCRService {
             false,
             onScreenWindowsOnly: true
         )
+        // The user can revoke permission or change the per-App privacy policy
+        // while ScreenCaptureKit enumerates shareable content.
+        guard authorizationCheck() else { throw CancellationError() }
         guard let display = content.displays.first(where: { $0.displayID == region.displayID }) else {
             throw ScreenTextOCRError.displayUnavailable
         }
@@ -656,6 +773,329 @@ struct ScreenRegionOCRService {
         )
         try Task.checkCancellation()
         return image
+    }
+}
+
+/// A continuous ScreenCaptureKit bridge for explicit subtitle regions. Its
+/// callback owns exactly one latest CVPixelBuffer; old frames are released as
+/// soon as a newer frame arrives. It deliberately never makes a CGImage.
+enum SubtitleCaptureStreamTerminal: Equatable, Sendable {
+    case stopped
+    case failed(message: String)
+
+    var statusMessage: String {
+        switch self {
+        case .stopped:
+            return "字幕画面捕获已停止。"
+        case let .failed(message):
+            return "字幕画面捕获已中断：\(message)"
+        }
+    }
+
+    var requiresApplicationShutdown: Bool {
+        if case .failed = self { return true }
+        return false
+    }
+}
+
+final class SubtitleCaptureStream: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
+    private struct SendableStreamReference: @unchecked Sendable {
+        let value: SCStream
+    }
+
+    private struct CaptureSettings: Sendable {
+        let sourceRect: CGRect
+        let width: Int
+        let height: Int
+        let pixelFormat: OSType
+        let queueDepth: Int
+        let showsCursor: Bool
+
+        func configuration(minimumFrameInterval: CMTime) -> SCStreamConfiguration {
+            let value = SCStreamConfiguration()
+            value.sourceRect = sourceRect
+            value.width = width
+            value.height = height
+            value.pixelFormat = pixelFormat
+            value.queueDepth = queueDepth
+            value.showsCursor = showsCursor
+            value.minimumFrameInterval = minimumFrameInterval
+            return value
+        }
+    }
+
+    private let lifecycleLock = NSLock()
+    private let sampleQueue = DispatchQueue(
+        label: "local.codex.ClaudePromptTranslator.subtitle-capture",
+        qos: .userInitiated
+    )
+    private let latestSlot = SubtitleLatestPixelBufferSlot()
+    private let capturePermissionCheck: @Sendable () -> Bool
+    private let captureSettings: CaptureSettings
+    private var currentFrameInterval: TimeInterval
+    private var startLifecycle = CaptureStartLifecycle()
+    private var terminalState: SubtitleCaptureStreamTerminal?
+    private var stream: SCStream?
+
+    init(
+        filter: SCContentFilter,
+        configuration: SCStreamConfiguration,
+        capturePermissionCheck: @escaping @Sendable () -> Bool = {
+            ScreenRecordingPermission.isGranted
+        }
+    ) throws {
+        captureSettings = CaptureSettings(
+            sourceRect: configuration.sourceRect,
+            width: configuration.width,
+            height: configuration.height,
+            pixelFormat: configuration.pixelFormat,
+            queueDepth: configuration.queueDepth,
+            showsCursor: configuration.showsCursor
+        )
+        currentFrameInterval = max(configuration.minimumFrameInterval.seconds, 0.25)
+        self.capturePermissionCheck = capturePermissionCheck
+        super.init()
+        let createdStream = SCStream(filter: filter, configuration: configuration, delegate: self)
+        try createdStream.addStreamOutput(
+            self,
+            type: .screen,
+            sampleHandlerQueue: sampleQueue
+        )
+        stream = createdStream
+    }
+
+    func start() async throws {
+        let startContext: (stream: SCStream, token: CaptureStartToken)? = lifecycleLock.withLock {
+            guard let stream,
+                  let token = startLifecycle.beginStart() else { return nil }
+            return (stream, token)
+        }
+        guard let startContext else { throw CancellationError() }
+        let activeStream = startContext.stream
+        let startToken = startContext.token
+        do {
+            try await activeStream.startCapture()
+        } catch {
+            let ownedFailedStream = lifecycleLock.withLock { () -> SCStream? in
+                guard startLifecycle.failStart(startToken), stream === activeStream else {
+                    return nil
+                }
+                terminalState = .failed(message: error.localizedDescription)
+                stream = nil
+                return activeStream
+            }
+            // `startCapture()` may fail after partially activating a stream.
+            // Stop only the stream owned by this token and never a newer one.
+            if let ownedFailedStream { try? await ownedFailedStream.stopCapture() }
+            latestSlot.stopAndDiscard()
+            throw error
+        }
+
+        let retained = lifecycleLock.withLock {
+            stream === activeStream && startLifecycle.markStarted(startToken)
+        }
+        guard retained else {
+            // `stop()` can complete while `startCapture()` is suspended. Its
+            // earlier stopCapture call is not sufficient because the start may
+            // win afterwards, so stop this local stream once more on return.
+            try? await activeStream.stopCapture()
+            throw CancellationError()
+        }
+    }
+
+    /// Transfers the one retained latest buffer to Vision. A nil result simply
+    /// means no complete screen frame has arrived since the prior poll.
+    func takeLatestPixelBuffer() -> CVPixelBuffer? {
+        latestSlot.take()
+    }
+
+    var isActive: Bool {
+        lifecycleLock.withLock {
+            stream != nil && startLifecycle.activeToken != nil && terminalState == nil
+        }
+    }
+
+    var terminal: SubtitleCaptureStreamTerminal? {
+        lifecycleLock.withLock { terminalState }
+    }
+
+    /// Applies the same adaptive 4/2 fps cadence to ScreenCaptureKit itself,
+    /// not merely to the downstream Vision consumer. This avoids producing
+    /// discarded 4 fps surfaces while a subtitle region is static.
+    func updateMinimumFrameInterval(_ interval: TimeInterval) async throws {
+        let boundedInterval = min(max(interval, 0.25), 0.5)
+        let update = lifecycleLock.withLock { () -> (SCStream, SCStreamConfiguration)? in
+            guard let stream,
+                  abs(currentFrameInterval - boundedInterval) > 0.001 else { return nil }
+            currentFrameInterval = boundedInterval
+            let time = CMTime(seconds: boundedInterval, preferredTimescale: 600)
+            return (stream, captureSettings.configuration(minimumFrameInterval: time))
+        }
+        guard let (activeStream, configuration) = update else { return }
+        try await activeStream.updateConfiguration(configuration)
+    }
+
+    func stop() async {
+        latestSlot.stopAndDiscard()
+        let activeStream = lifecycleLock.withLock { () -> SCStream? in
+            _ = startLifecycle.invalidate()
+            if terminalState == nil { terminalState = .stopped }
+            let activeStream = stream
+            stream = nil
+            return activeStream
+        }
+        guard let activeStream else { return }
+        try? await activeStream.stopCapture()
+    }
+
+    func stream(
+        _ stream: SCStream,
+        didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
+        of outputType: SCStreamOutputType
+    ) {
+        guard capturePermissionCheck() else {
+            terminateForRevokedPermission(stream)
+            return
+        }
+        guard outputType == .screen,
+              CMSampleBufferIsValid(sampleBuffer),
+              let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            return
+        }
+        _ = latestSlot.offer(pixelBuffer)
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        let wasActive = lifecycleLock.withLock {
+            guard self.stream === stream else { return false }
+            _ = startLifecycle.invalidate()
+            terminalState = .failed(message: error.localizedDescription)
+            self.stream = nil
+            return true
+        }
+        if wasActive { latestSlot.stopAndDiscard() }
+    }
+
+    private func terminateForRevokedPermission(_ callbackStream: SCStream) {
+        let streamToStop = lifecycleLock.withLock { () -> SCStream? in
+            guard stream === callbackStream else { return nil }
+            _ = startLifecycle.invalidate()
+            terminalState = .failed(message: "屏幕录制权限已撤销")
+            stream = nil
+            return callbackStream
+        }
+        guard let streamToStop else { return }
+        latestSlot.stopAndDiscard()
+        let reference = SendableStreamReference(value: streamToStop)
+        Task { try? await reference.value.stopCapture() }
+    }
+}
+
+/// Pure token/state coordinator for ScreenCaptureKit's asynchronous start.
+/// `invalidate()` is synchronous so callers can make an in-flight start stale
+/// before awaiting `stopCapture()`. A stale completion must stop its local
+/// stream instead of publishing it as active.
+struct CaptureStartToken: Equatable, Sendable {
+    let generation: UInt64
+}
+
+struct CaptureStartLifecycle: Sendable {
+    private enum Phase: Equatable, Sendable {
+        case idle
+        case starting(CaptureStartToken)
+        case running(CaptureStartToken)
+    }
+
+    private var nextGeneration: UInt64 = 0
+    private var phase: Phase = .idle
+
+    mutating func beginStart() -> CaptureStartToken? {
+        guard phase == .idle else { return nil }
+        nextGeneration &+= 1
+        let token = CaptureStartToken(generation: nextGeneration)
+        phase = .starting(token)
+        return token
+    }
+
+    mutating func markStarted(_ token: CaptureStartToken) -> Bool {
+        guard phase == .starting(token) else { return false }
+        phase = .running(token)
+        return true
+    }
+
+    @discardableResult
+    mutating func failStart(_ token: CaptureStartToken) -> Bool {
+        guard phase == .starting(token) else { return false }
+        phase = .idle
+        return true
+    }
+
+    @discardableResult
+    mutating func invalidate() -> CaptureStartToken? {
+        let token: CaptureStartToken?
+        switch phase {
+        case .idle:
+            token = nil
+        case let .starting(active), let .running(active):
+            token = active
+        }
+        phase = .idle
+        return token
+    }
+
+    func accepts(_ token: CaptureStartToken) -> Bool {
+        switch phase {
+        case .idle:
+            return false
+        case let .starting(active), let .running(active):
+            return active == token
+        }
+    }
+
+    var activeToken: CaptureStartToken? {
+        switch phase {
+        case .idle:
+            return nil
+        case let .starting(token), let .running(token):
+            return token
+        }
+    }
+
+    var isActive: Bool { activeToken != nil }
+}
+
+/// The only retained capture payload between ScreenCaptureKit callbacks and
+/// Vision. It is deliberately a one-item overwrite slot, and `stopAndDiscard`
+/// makes late callbacks no-ops before releasing its final buffer.
+final class SubtitleLatestPixelBufferSlot: @unchecked Sendable {
+    private let lock = NSLock()
+    private var latestPixelBuffer: CVPixelBuffer?
+    private var isStopped = false
+
+    @discardableResult
+    func offer(_ pixelBuffer: CVPixelBuffer) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isStopped else { return false }
+        // Strong assignment retains this callback-owned Core Video surface and
+        // atomically releases the prior one, so the slot can never grow.
+        latestPixelBuffer = pixelBuffer
+        return true
+    }
+
+    func take() -> CVPixelBuffer? {
+        lock.lock()
+        defer { lock.unlock() }
+        let buffer = latestPixelBuffer
+        latestPixelBuffer = nil
+        return buffer
+    }
+
+    func stopAndDiscard() {
+        lock.withLock {
+            isStopped = true
+            latestPixelBuffer = nil
+        }
     }
 }
 

@@ -1,4 +1,4 @@
-# 无感翻译（ClaudePromptTranslator 0.8.0）
+# 无感翻译（ClaudePromptTranslator 0.8.1）
 
 一个原生 macOS 跨应用选区翻译工具。它的主流程已经从“只识别 AI 聊天输入框”调整为：
 
@@ -22,7 +22,7 @@ Accessibility 快速读取（不碰剪贴板）
 
 > App 可见名称改为“无感翻译”，可执行文件名和 bundle id 仍保持 `ClaudePromptTranslator` / `local.codex.ClaudePromptTranslator`，避免升级时无故丢失已有的辅助功能授权。
 
-0.8.0 已完成核心轻量化、资源生命周期、翻译队列、回复扫描预算、OCR/字幕内存边界和安全打包。浏览器 native bridge、Safari `.appex`、私有 ASR 生产 catalog/引擎、Sparkle 嵌入签名以及 Developer ID 公证仍是后续门，不能把现有前端或接口代码当作已分发功能。详见 [1.0 实施状态](docs/LIGHTWEIGHT_1_0_STATUS.md) 与 [性能/发布门](docs/PERFORMANCE_GATES.md)。
+0.8.1 已完成核心轻量化、资源生命周期、翻译队列、回复扫描预算、连续 OCR 字幕、设备端系统语音字幕，以及 Chromium native-messaging helper → 同 UID 本机 IPC → 已运行 App/Apple 本地翻译的代码与安全打包链。浏览器扩展当前只接受用户显式提供并安装的本机扩展 ID；仓库没有分配、硬编码或宣称一个固定生产 ID。Developer ID 签名/公证和真实 Chrome 安装验收仍未完成；Safari `.appex`、私有 ASR 生产 catalog/引擎与 Sparkle 嵌入签名也仍是后续门，不能把本机构建测试当作已公开分发。详见 [1.0 实施状态](docs/LIGHTWEIGHT_1_0_STATUS.md) 与 [性能/发布门](docs/PERFORMANCE_GATES.md)。
 
 ## 当前功能
 
@@ -53,7 +53,7 @@ Accessibility 快速读取（不碰剪贴板）
 - 默认启用“正文优先”内容筛选：在高置信度 X/Twitter 窗口中，被动选区与悬停会跳过导航、按钮、账号 handle、时间、互动计数、广告标签和独立 URL；显式选区与用户框选 OCR 永远保留用户选择，不会被站点规则擅自删减。无法确认站点时保持 fail-open，不猜测网页身份。
 - 菜单栏提供“App 隐私名单”：1Password、钥匙串/密码、Bitwarden、Dashlane、LastPass、KeePassXC 等敏感 App 内置禁止读取；用户也可把当前 App 加入名单。加入后会取消正在进行的输入、选区、悬停、OCR、字幕与回复任务，并清除对应可见内容和内存缓存。
 - “框选屏幕文字（OCR）”用于 Canvas、图片和不暴露文字的 App：用户拖出明确区域后，ScreenCaptureKit 只截取该区域，Vision 在本机识别，截图不落盘，识别完成后进入同一个翻译浮层。
-- “视频字幕翻译”重复识别用户固定框选的字幕区域，不扫描整屏；字幕连续两帧稳定后才翻译，重复内容命中有界内存缓存。支持双语/仅译文、深色/浅色/高对比和三档字号。
+- “视频字幕翻译”可选两种本地来源：用户固定框选的字幕区域 OCR，或用户明确启动的目标 App 设备端音频。区域 OCR 使用一次建立的来源 App 专属 `SCStream`，`queueDepth = 2`，最新 `CVPixelBuffer` 单槽直接进入 Vision；静态画面 2 fps、变化画面 4 fps。语音模式要求明确选择源语言，macOS 15–25 强制 `SFSpeechRecognizer` 设备端识别，macOS 26+ 使用 `SpeechAnalyzer`。两条路径共享稳定化、latest-wins 翻译、双语/仅译文、三种样式和三档字号。
 - OCR 字幕使用本地基础合并与断句：去除重复行，拉丁文字按词间空格合并，中日韩文字按字幕行连续合并。当前没有把字幕发送给外部 AI 做断句。
 - 长文本上限为输入 160,000 字符、AI 回复 96,000 字符、显式 OCR 60,000 字符；结构化分段上限为 3,000 字符。这里按 Swift Unicode 字符计数，并非 UTF-8 字节数。
 - 只读网页、PDF 和普通文本可复制译文；只有 Accessibility 能验证选区仍未变化、目标确实可写时，才显示“替换选区”。
@@ -84,6 +84,8 @@ Accessibility 快速读取（不碰剪贴板）
   - 多显示器区域框选、ScreenCaptureKit 单区域截图、Vision 本机 OCR 与取消。
 - `Sources/ClaudePromptTranslator/LiveSubtitleTranslation.swift`
   - 稳定帧字幕去重、基础断句、内存翻译缓存和可定制双语浮层。
+- `Sources/ClaudePromptTranslator/SubtitleSpeechSession.swift`
+  - 来源 App 专属音频流、Apple 设备端语音识别、结果 generation 与停止释放。
 - `Sources/ClaudePromptTranslator/SelectionOverlayController.swift`
   - 选区旁的单一非激活浮层、复制与受控替换。
 - `Sources/ClaudePromptTranslator/AppleTranslationCoordinator.swift`
@@ -114,7 +116,8 @@ Accessibility 快速读取（不碰剪贴板）
   └─ 指针下单个 AX 静态文本节点   不读输入框，不做窗口树扫描
 
 框选 OCR / 实时字幕（显式启动）
-  └─ 只截取用户指定矩形区域       Vision 本机识别；字幕两帧稳定后翻译
+  ├─ 指定矩形的连续 SCStream      CVPixelBuffer 单槽；Vision 本机识别
+  └─ 当前目标 App 的音频 SCStream Apple 设备端语音；不落盘、不网络回退
 ```
 
 自动检测不会沿网页全文反复扫描，也不会像旧 AI 回复模块一样定时遍历整个窗口树。
@@ -157,6 +160,8 @@ GPL/AGPL 项目只用于理解产品与架构模式，没有复制其源码。KI
 - AI 回复翻译与回复短期选区快照只接受 Accessibility 来源；即使用户另行开启剪贴板兼容，回复按钮和自动回复也绝不继承该路径。
 - App 隐私名单在每次捕获、OCR 与翻译交付前重查；加入名单会取消正在运行的区域选择、OCR、字幕和翻译任务，并清除可见原文/译文、回复缓存、字幕缓存与短期选区快照。
 - 浏览器自动 AI 兼容模式不再依据可伪造的窗口标题关键词；仅当 Accessibility 的 `AXWebArea/AXURL` 暴露 ChatGPT、Claude、Gemini 等精确允许域名时才启动输入/回复扫描。URL 不可得或只是普通网页标题提到 AI 时 fail-closed；显式通用选区仍可正常使用。
+- Chromium 扩展的 DOM 翻译使用单次即退出的独立 native host；host 只把最多 256 KiB 的严格帧送入当前用户的 `0700` App 目录 socket，App 以 peer UID、固定域白名单和菜单中的逐域授权共同校验。逐域授权默认空集，App 未运行、未授权或 Apple 本地语言包不可用时只返回无正文错误，不会启动 App、记录原文或静默回退云翻译。
+- Chromium native-host 安装脚本要求用户显式传入当前本机加载所得的 32 位扩展 ID，并只把该值写入当前用户的 `allowed_origins`。这个本机 ID 不是固定生产 ID，不能作为商店发布身份或公开分发完成的证据。
 - 开启剪贴板兼容模式前会警告：复制中的选区文字可能被第三方剪贴板管理器或 macOS 通用剪贴板观察；它只适合用户接受该风险、且目标 App 不提供 Accessibility 文本时临时使用。
 - 密码框、带 secure/password 角色或 `AXContainsProtectedContent` 的 Accessibility 元素会被排除；剪贴板 fallback 会检查焦点元素及最多 12 层祖先。
 - 剪贴板 fallback 只在用户明确开启兼容模式后使用；不预写 sentinel。它优先通过 AX 执行精确匹配、无额外修饰键且已启用的“复制”菜单，找不到时才发送定向 `Command+C`。它要求一次稳定 change count，并在约 90ms 静默期持续校验原 PID、焦点、选区范围与真实输入代次；任何第二次写入或用户输入都会放弃结果且不恢复，从而保留当前剪贴板。
@@ -167,7 +172,7 @@ GPL/AGPL 项目只用于理解产品与架构模式，没有复制其源码。KI
 - 冷启动时系统偶尔会先报告语言包已安装、稍后才让本地会话就绪；应用先在 500ms 内做两次有界就绪检查，仍未就绪时回到 Apple 官方 `translationTask` 本地准备流程，不会切换到网络翻译。
 - 正式应用为仅本地翻译模式：Apple 不支持的语言组合会直接提示失败，不会降级到第三方网络服务。
 - 两周本机语言偏好学习默认开启，从第一次成功的主动翻译开始计时；满 14 天、累计至少 8 次且某方向达到 67% 后，才会影响自动语言路由。它只持久化评估时间、语言标识与聚合次数/分数，不保存原文、译文、App 或窗口信息；回复翻译、自动选区、悬停和字幕不计入，用户可随时关闭或确认后重置。
-- AI 回复短期缓存只保存在内存中，使用 SHA-256 键、32 项上限和 5 分钟 TTL；字幕缓存同样只使用摘要键、160 项上限和 5 分钟 TTL。停止、屏蔽、重置或切换时清空。通用浮层的紧凑状态不显示选区原文。
+- AI 回复短期缓存只保存在内存中，使用 SHA-256 键、16 项/1 MiB 上限和 180 秒 TTL；字幕缓存同样只使用摘要键、64 项/512 KiB 上限和 180 秒 TTL。超大结果仍可显示但不入缓存；停止、屏蔽、重置或切换时清空。通用浮层的紧凑状态不显示选区原文。
 - 通用选区去重指纹只保存 PID、元素/范围标识和 SHA-256 摘要，不再把选区原文拼入指纹；暂停翻译器会同时取消选区、悬停、区域 OCR 和字幕任务并清空对应可见正文状态。
 - Release 打包会检查并拒绝包含旧网络兼容端点或调试自测入口的二进制，并启用 hardened runtime；进程读取/改写自测只存在于 Debug 构建。
 - 自动选区、悬停与自动回复扫描都不会调用 OCR。屏幕录制权限与辅助功能权限保持分离；只有用户明确选择“框选屏幕文字”、启动“视频字幕翻译”，或第二次点击 AI 回复“OCR 重试”时才会截取限定区域。通用区域 OCR/字幕只包含启动流程的来源 App 窗口，拖到其他 App 不会捕获其像素；回复 OCR 使用“显示器过滤 + 仅包含目标窗口 + 近似对话区域 sourceRect”，避免先获取侧栏/工具栏的整窗像素。OCR 图片不保存、不写剪贴板。
@@ -265,6 +270,7 @@ NOTARY_PROFILE="your-notarytool-profile" Scripts/create-dmg.sh
 | AX 静态英文文本悬停 | 稳定 0.65 秒后翻译；输入框与密码框不触发 |
 | Canvas / 图片框选 OCR | 只识别框选区域；退出框选可取消；截图不落盘 |
 | 视频字幕区域 | 相同画面两帧稳定后双语显示；重复字幕不重复翻译；停止后不再截屏 |
+| 当前视频 App 的设备端语音 | 用户明确选择源语言并启动；只捕获目标 App 音频；停止后无识别结果；无网络回退 |
 | Accessibility 不暴露选区的 App，兼容模式关闭 | 明确提示无法读取；完全不访问剪贴板 |
 | Accessibility 不暴露选区的 App，用户开启兼容模式 | `⌃⌥T` 才允许复制兜底；上下文歧义时安全放弃 |
 | 图片、文件、多 item 剪贴板 | 兼容模式稳定成功时完整恢复；竞态时不覆盖新内容 |
@@ -305,7 +311,7 @@ NOTARY_PROFILE="your-notarytool-profile" Scripts/create-dmg.sh
 - 某些浏览器或 App 既不暴露标准选区，也不暴露 WebView 文本标记选区，因此被动“翻译”按钮仍可能不出现；默认按 `⌃⌥T` 也不会绕过隐私策略。只有用户明确开启剪贴板兼容模式后，通用选区快捷键才会尝试复制 fallback。AI 回复按钮无条件禁用剪贴板；无法从 Accessibility 读取时只会回退到最新回复，或在用户第二次明确点击后使用 OCR。
 - 回复 OCR 的对话矩形是按 ChatGPT、Claude 等布局比例计算的隐私收窄方案，不是 DOM 语义区域；应用改版、浮动面板、极窄窗口或跨显示器窗口可能导致正文漏截。此时应优先选中回复，或使用用户明确框选的区域 OCR，而不是放宽为整窗捕获。
 - 独立 macOS App 不能像浏览器扩展一样读取 MutationObserver、修改网页 DOM 或保留 DOM 链接/富文本节点。因此 ChatGPT/Claude 桌面端采用选区/悬停/字幕浮层；“整页原文下插入译文”“隐藏网页原文”和站点 CSS 规则仍需要浏览器扩展或 App 官方插件能力。
-- 区域 OCR 与实时字幕已经可用于 Canvas、图片和视频，但依赖屏幕录制权限、画面清晰度、字幕无遮挡和固定区域。它不会自动发现视频字幕位置，也不会识别被框选区域之外的变化。
+- 区域 OCR 与实时字幕已经可用于 Canvas、图片和视频，但依赖屏幕录制权限、画面清晰度、字幕无遮挡和固定区域。它不会自动发现视频字幕位置，也不会识别被框选区域之外的变化。设备端语音需要用户正确选择源语言，语言不匹配、系统资产未安装或目标 App 不提供可捕获音频时会明确失败；当前仍需在解锁桌面做真实视频验收。
 - 当前字幕断句是本地规则，不是外部 AI 断句；快速滚动字幕、卡拉 OK 逐字高亮、多说话人重叠或每帧变化的动画字幕仍可能等待不够稳定或出现 OCR 抖动。
 - 悬停翻译仅支持 Accessibility 暴露的静态文字；Canvas、图片和部分 Electron/WebView 节点必须改用区域 OCR。
 - 当前只在本应用浮层内恢复 Markdown 链接与基础强调；结构分段会保护代码块、URL、Markdown/HTML 标记，但不能恢复来源 App 的原字号、颜色、复杂富文本排版，也不能把样式写回 ChatGPT/Claude。

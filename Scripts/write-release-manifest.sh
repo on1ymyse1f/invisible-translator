@@ -17,9 +17,10 @@ if [[ "${RELEASE_CHANNEL}" != "local-test-unnotarized" \
 fi
 APP_NAME="ClaudePromptTranslator"
 APP_BINARY="${APP_PATH}/Contents/MacOS/${APP_NAME}"
+NATIVE_HOST_BINARY="${APP_PATH}/Contents/MacOS/ClaudePromptTranslatorNativeHost"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-if [[ ! -x "${APP_BINARY}" || ! -f "${ZIP_PATH}" ]]; then
+if [[ ! -x "${APP_BINARY}" || ! -x "${NATIVE_HOST_BINARY}" || ! -f "${ZIP_PATH}" ]]; then
   echo "Cannot write manifest for an incomplete artifact." >&2
   exit 1
 fi
@@ -28,6 +29,7 @@ version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${APP
 bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "${APP_PATH}/Contents/Info.plist")"
 git_sha="$(git -C "${ROOT_DIR}" rev-parse HEAD)"
 binary_sha="$(/usr/bin/shasum -a 256 "${APP_BINARY}" | /usr/bin/awk '{print $1}')"
+native_host_sha="$(/usr/bin/shasum -a 256 "${NATIVE_HOST_BINARY}" | /usr/bin/awk '{print $1}')"
 zip_sha="$(/usr/bin/shasum -a 256 "${ZIP_PATH}" | /usr/bin/awk '{print $1}')"
 app_bytes="$(/usr/bin/du -sk "${APP_PATH}" | /usr/bin/awk '{print $1 * 1024}')"
 zip_bytes="$(/usr/bin/stat -f '%z' "${ZIP_PATH}")"
@@ -45,6 +47,7 @@ cat >"${tmp_path}" <<EOF
   "appBytes": ${app_bytes},
   "zipBytes": ${zip_bytes},
   "executableSHA256": "${binary_sha}",
+  "nativeHostSHA256": "${native_host_sha}",
   "zipSHA256": "${zip_sha}"
 }
 EOF

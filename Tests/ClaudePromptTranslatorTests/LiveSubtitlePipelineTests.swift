@@ -1,4 +1,5 @@
 import CoreGraphics
+import CoreVideo
 import XCTest
 @testable import ClaudePromptTranslator
 
@@ -57,6 +58,33 @@ final class LiveSubtitlePipelineTests: XCTestCase {
                 averageConfidence: 0.9
             )
         )
+    }
+
+    func testProductionSubtitleFrameCarriesPixelBufferWithoutCGImage() throws {
+        let pixelBuffer = try makePixelBuffer(width: 64, height: 36)
+        let frame = LiveSubtitleFrame(sequence: 1, pixelBuffer: pixelBuffer)
+
+        XCTAssertNotNil(frame.pixelBuffer)
+        XCTAssertNil(frame.testImage)
+        XCTAssertEqual(CVPixelBufferGetWidth(try XCTUnwrap(frame.pixelBuffer)), 64)
+        XCTAssertEqual(CVPixelBufferGetHeight(try XCTUnwrap(frame.pixelBuffer)), 36)
+    }
+
+    func testLatestPixelBufferSlotRetainsOnlyOneAndRejectsFramesAfterStop() throws {
+        let slot = SubtitleLatestPixelBufferSlot()
+        let first = try makePixelBuffer(width: 32, height: 18)
+        let second = try makePixelBuffer(width: 64, height: 36)
+
+        XCTAssertTrue(slot.offer(first))
+        XCTAssertTrue(slot.offer(second))
+        let latest = try XCTUnwrap(slot.take())
+        XCTAssertEqual(CVPixelBufferGetWidth(latest), 64)
+        XCTAssertNil(slot.take())
+
+        XCTAssertTrue(slot.offer(first))
+        slot.stopAndDiscard()
+        XCTAssertNil(slot.take())
+        XCTAssertFalse(slot.offer(second))
     }
 
     func testSubtitleSimilarityStabilizesMinorOCRJitterWithoutDuplicateEmission() {
@@ -189,12 +217,18 @@ final class LiveSubtitlePipelineTests: XCTestCase {
         let image = try makeImage()
         let recognition = RecognitionProbe()
         let translation = TranslationGate()
+        let recorder = EventRecorder()
         let pipeline = LiveSubtitlePipeline(
             recognizer: { frame in await recognition.recognize(frame) },
             targetResolver: { _ in .simplifiedChinese },
             translator: { text, _ in await translation.translate(text) }
         )
         let session = await pipeline.start()
+        let eventTask = Task {
+            for await event in session.events {
+                await recorder.append(event)
+            }
+        }
 
         for sequence in 1...6 {
             _ = await pipeline.submitFrame(
@@ -227,6 +261,70 @@ final class LiveSubtitlePipelineTests: XCTestCase {
             completedTranslations,
             ["First stable subtitle", "Third stable subtitle"]
         )
+        let latestDelivered = await eventually {
+            await recorder.events().contains { event in
+                guard case let .translated(_, sequence, sourceText, output, cacheHit) = event
+                else { return false }
+                return sequence == 6
+                    && sourceText == "Third stable subtitle"
+                    && output.text == "translated: Third stable subtitle"
+                    && !cacheHit
+            }
+        }
+        XCTAssertTrue(latestDelivered)
+        await pipeline.stop()
+        await eventTask.value
+
+        let events = await recorder.events()
+        let startedEvents = events.compactMap { event -> String? in
+            guard case let .translationStarted(_, sequence, text) = event else { return nil }
+            return "\(sequence):\(text)"
+        }
+        XCTAssertEqual(
+            startedEvents,
+            [
+                "2:First stable subtitle",
+                "6:Third stable subtitle",
+            ]
+        )
+
+        let translatedEvents = events.compactMap {
+            event -> String? in
+            guard case let .translated(_, sequence, sourceText, output, cacheHit) = event
+            else { return nil }
+            return "\(sequence):\(sourceText):\(output.text):\(cacheHit)"
+        }
+        XCTAssertEqual(
+            translatedEvents,
+            ["6:Third stable subtitle:translated: Third stable subtitle:false"]
+        )
+        XCTAssertFalse(events.contains { event in
+            if case .translationFailed = event { return true }
+            return false
+        })
+    }
+
+    func testOnDeviceSpeechTextUsesTheSharedStableTranslationPipeline() async {
+        let translation = TranslationGate()
+        let pipeline = LiveSubtitlePipeline(
+            targetResolver: { _ in .simplifiedChinese },
+            translator: { text, _ in await translation.translate(text) }
+        )
+        let session = await pipeline.start()
+
+        let accepted = await pipeline.submitRecognizedText(
+            "A spoken subtitle",
+            sequence: 1,
+            generation: session.generation,
+            isFinal: true
+        )
+        XCTAssertTrue(accepted)
+        let started = await eventually { await translation.started().count == 1 }
+        XCTAssertTrue(started)
+        let startedTexts = await translation.started()
+        XCTAssertEqual(startedTexts, ["A spoken subtitle"])
+
+        await translation.releaseFirstTranslation()
         await pipeline.stop()
     }
 
@@ -284,6 +382,28 @@ final class LiveSubtitlePipelineTests: XCTestCase {
         await pipeline.stop()
     }
 
+    func testGenerationScopedStopCannotTerminateReplacementSession() async {
+        let pipeline = LiveSubtitlePipeline(
+            targetResolver: { _ in .simplifiedChinese },
+            translator: { text, _ in
+                TranslationProviderOutput(text: text, providerName: "test")
+            }
+        )
+        let first = await pipeline.start()
+        let replacement = await pipeline.start()
+
+        await pipeline.stop(generation: first.generation)
+        let accepted = await pipeline.submitRecognizedText(
+            "replacement remains active",
+            sequence: 1,
+            generation: replacement.generation,
+            isFinal: true
+        )
+
+        XCTAssertTrue(accepted)
+        await pipeline.stop(generation: replacement.generation)
+    }
+
     private func makeImage() throws -> CGImage {
         let context = try XCTUnwrap(
             CGContext(
@@ -297,6 +417,20 @@ final class LiveSubtitlePipelineTests: XCTestCase {
             )
         )
         return try XCTUnwrap(context.makeImage())
+    }
+
+    private func makePixelBuffer(width: Int, height: Int) throws -> CVPixelBuffer {
+        var pixelBuffer: CVPixelBuffer?
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            kCVPixelFormatType_32BGRA,
+            [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary,
+            &pixelBuffer
+        )
+        XCTAssertEqual(status, kCVReturnSuccess)
+        return try XCTUnwrap(pixelBuffer)
     }
 
     private func eventually(

@@ -186,13 +186,7 @@ struct ResponseTranslationCache: Sendable {
     }
 
     mutating func insert(_ translation: String, for source: String, now: Date = Date()) {
-        removeExpiredEntries(now: now)
-        let key = Self.key(for: source)
-        entries.removeAll { $0.key == key }
-        entries.append((key: key, translation: translation, expiresAt: now.addingTimeInterval(timeToLive)))
-        if entries.count > capacity {
-            entries.removeFirst(entries.count - capacity)
-        }
+        insert(translation, forKey: Self.key(for: source), now: now)
     }
 
     mutating func translation(for response: DetectedForeignResponse, now: Date = Date()) -> String? {

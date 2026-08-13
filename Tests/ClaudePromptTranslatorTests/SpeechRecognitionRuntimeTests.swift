@@ -20,6 +20,14 @@ final class SpeechRecognitionRuntimeTests: XCTestCase {
         XCTAssertTrue(SystemSpeechResolution.systemUnsupported.shouldOfferPrivateModel)
     }
 
+    func testSpeechLocaleChoicesAreExplicitAndStable() {
+        XCTAssertEqual(SubtitleSpeechLocale.englishUS.localeIdentifier, "en-US")
+        XCTAssertEqual(SubtitleSpeechLocale.simplifiedChinese.localeIdentifier, "zh-CN")
+        XCTAssertEqual(SubtitleSpeechLocale.japanese.localeIdentifier, "ja-JP")
+        XCTAssertFalse(SubtitleSpeechLocale.system.localeIdentifier.isEmpty)
+        XCTAssertEqual(SubtitleSpeechLocale.allCases.count, 4)
+    }
+
     func testAudioRingBufferCapsBothBytesAndDuration() async {
         let buffer = SpeechAudioRingBuffer()
         let packet = SpeechAudioPacket(
@@ -102,6 +110,38 @@ final class SpeechRecognitionRuntimeTests: XCTestCase {
         await second.release()
     }
 
+    func testConcurrentAcquireAdmitsOnlyOneFactoryLoad() async throws {
+        let store = try await makeInstalledStore()
+        let recorder = TestEngineRecorder()
+        let gate = SuspendingEngineFactoryGate()
+        let pool = RecognitionEnginePool(
+            modelStore: store,
+            idleUnloadInterval: 30,
+            engineFactory: { _ in
+                await gate.suspendOnce()
+                return TestEngine(recorder: recorder)
+            }
+        )
+
+        let firstTask = Task {
+            try await pool.acquire(modelID: "synthetic-asr")
+        }
+        await gate.waitUntilSuspended()
+
+        do {
+            _ = try await pool.acquire(modelID: "synthetic-asr")
+            XCTFail("A concurrent acquire must fail before starting a second model load.")
+        } catch {
+            XCTAssertEqual(error as? RecognitionEnginePoolError, .engineBusy)
+        }
+
+        await gate.release()
+        let first = try await firstTask.value
+        let active = await pool.hasActiveLease()
+        XCTAssertTrue(active)
+        await first.release()
+    }
+
     private func makeInstalledStore(now: Date = Date()) async throws -> ASRModelStore {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("CPT-SpeechRuntimeTests-\(UUID().uuidString)", isDirectory: true)
@@ -141,6 +181,35 @@ private actor TestEngineRecorder {
     private(set) var unloadCount = 0
 
     func recordUnload() { unloadCount += 1 }
+}
+
+private actor SuspendingEngineFactoryGate {
+    private var didSuspend = false
+    private var suspensionContinuation: CheckedContinuation<Void, Never>?
+    private var waiterContinuations: [CheckedContinuation<Void, Never>] = []
+
+    func suspendOnce() async {
+        guard !didSuspend else { return }
+        didSuspend = true
+        let waiters = waiterContinuations
+        waiterContinuations.removeAll()
+        for waiter in waiters { waiter.resume() }
+        await withCheckedContinuation { continuation in
+            suspensionContinuation = continuation
+        }
+    }
+
+    func waitUntilSuspended() async {
+        if didSuspend { return }
+        await withCheckedContinuation { continuation in
+            waiterContinuations.append(continuation)
+        }
+    }
+
+    func release() {
+        suspensionContinuation?.resume()
+        suspensionContinuation = nil
+    }
 }
 
 private final class TestEngine: PrivateASRRecognizing, @unchecked Sendable {

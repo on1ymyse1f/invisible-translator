@@ -65,6 +65,49 @@ enum ManualResponsePresentationPolicy {
     }
 }
 
+enum ForegroundAXNotificationReliability: Equatable {
+    case reliable
+    case unproven
+}
+
+/// Keeps notification-driven hosts quiet while retaining bounded polling for
+/// WebKit/Electron and for hosts whose AX notification coverage is unproven.
+enum AIContextRefreshPolicy {
+    static let reliableWatchdogInterval: TimeInterval = 15
+    static let compatibilityWatchdogInterval: TimeInterval = 2
+
+    static func notificationReliability(
+        registrationComplete: Bool,
+        observedContentNotification: Bool
+    ) -> ForegroundAXNotificationReliability {
+        registrationComplete && observedContentNotification ? .reliable : .unproven
+    }
+
+    static func watchdogInterval(
+        hasActiveAIContext: Bool,
+        notificationReliability: ForegroundAXNotificationReliability,
+        requiresCompatibilityPolling: Bool
+    ) -> TimeInterval {
+        guard hasActiveAIContext else { return reliableWatchdogInterval }
+        guard notificationReliability == .reliable,
+              !requiresCompatibilityPolling else {
+            return compatibilityWatchdogInterval
+        }
+        return reliableWatchdogInterval
+    }
+
+    static func responseScanInterval(
+        notificationReliability: ForegroundAXNotificationReliability,
+        requiresCompatibilityPolling: Bool
+    ) -> TimeInterval {
+        watchdogInterval(
+            hasActiveAIContext: true,
+            notificationReliability: notificationReliability,
+            requiresCompatibilityPolling: requiresCompatibilityPolling
+        )
+    }
+}
+
 // MARK: - UnifiedEdgeBarController
 
 /// Single controller replacing FloatingTriggerController, OutputTranslateButtonController,
@@ -165,7 +208,6 @@ final class UnifiedEdgeBarController: NSObject {
     private var lastAutoScan = Date.distantPast
     private var manualResponsePresentationUntil = Date.distantPast
     private let inputScanInterval: TimeInterval = 0.35
-    private let autoScanInterval: TimeInterval = 2.0
     private let stableDelay: TimeInterval = 1.0
     private let dragSettleDelay: TimeInterval = 0.9
 
@@ -337,6 +379,7 @@ final class UnifiedEdgeBarController: NSObject {
             cachedUsesSelectedInput = false
             lastInputScan = .distantPast
             lastFullInputTargetScan = .distantPast
+            lastAutoScan = .distantPast
             pendingResponse = nil
             pendingSince = nil
         }
@@ -413,10 +456,17 @@ final class UnifiedEdgeBarController: NSObject {
     private func armWatchdog() {
         watchdogTask?.cancel()
         guard lifecycleRunning else { return }
-        let interval: Duration = currentApp == nil ? .seconds(15) : .seconds(2)
+        let interval = AIContextRefreshPolicy.watchdogInterval(
+            hasActiveAIContext: currentApp != nil,
+            notificationReliability: inputAccessibilityObserver?.notificationReliability
+                ?? .unproven,
+            requiresCompatibilityPolling: currentApp.map {
+                model.detector.requiresCompatibilityPolling($0)
+            } ?? false
+        )
         watchdogTask = Task { @MainActor [weak self] in
             do {
-                try await Task.sleep(for: interval)
+                try await Task.sleep(for: .seconds(interval))
             } catch {
                 return
             }
@@ -529,6 +579,7 @@ final class UnifiedEdgeBarController: NSObject {
             guard let self else { return }
             lastInputScan = .distantPast
             lastFullInputTargetScan = .distantPast
+            lastAutoScan = .distantPast
             refresh()
         }
     }
@@ -607,7 +658,12 @@ final class UnifiedEdgeBarController: NSObject {
               responseScanTask == nil else {
             return
         }
-        guard Date().timeIntervalSince(lastAutoScan) >= autoScanInterval else { return }
+        let scanInterval = AIContextRefreshPolicy.responseScanInterval(
+            notificationReliability: inputAccessibilityObserver?.notificationReliability
+                ?? .unproven,
+            requiresCompatibilityPolling: model.detector.requiresCompatibilityPolling(app)
+        )
+        guard Date().timeIntervalSince(lastAutoScan) >= scanInterval else { return }
         lastAutoScan = Date()
         responseScanGeneration &+= 1
         let scanGeneration = responseScanGeneration
@@ -1379,9 +1435,25 @@ final class UnifiedEdgeBarController: NSObject {
 private final class InputAccessibilityObserver {
     let processIdentifier: pid_t
 
+    private(set) var notificationReliability: ForegroundAXNotificationReliability = .unproven
+
     private var observer: AXObserver?
     private var applicationElement: AXUIElement?
+    private var observedWindowElement: AXUIElement?
+    private var hasCompleteApplicationNotificationRegistration = false
+    private var hasCompleteNotificationRegistration = false
     private let onChange: @MainActor () -> Void
+
+    private static let applicationNotifications = [
+        kAXFocusedUIElementChangedNotification,
+        kAXFocusedWindowChangedNotification,
+        kAXWindowCreatedNotification
+    ]
+
+    private static let windowContentNotifications = [
+        kAXLayoutChangedNotification,
+        kAXValueChangedNotification
+    ]
 
     init?(
         processIdentifier: pid_t,
@@ -1405,19 +1477,29 @@ private final class InputAccessibilityObserver {
         self.applicationElement = applicationElement
 
         let context = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
-        let notifications = [
-            kAXFocusedUIElementChangedNotification,
-            kAXFocusedWindowChangedNotification,
-            kAXWindowCreatedNotification
-        ]
-        for notification in notifications {
-            _ = AXObserverAddNotification(
+        let applicationResults = Self.applicationNotifications.map { notification in
+            AXObserverAddNotification(
                 createdObserver,
                 applicationElement,
                 notification as CFString,
                 context
             )
         }
+
+        let windowHasContentCoverage = observeFocusedWindowContent(
+            observer: createdObserver,
+            applicationElement: applicationElement,
+            context: context
+        )
+        hasCompleteApplicationNotificationRegistration = applicationResults.allSatisfy {
+            $0 == .success
+        }
+        hasCompleteNotificationRegistration = hasCompleteApplicationNotificationRegistration
+            && windowHasContentCoverage
+        notificationReliability = AIContextRefreshPolicy.notificationReliability(
+            registrationComplete: hasCompleteNotificationRegistration,
+            observedContentNotification: false
+        )
 
         CFRunLoopAddSource(
             CFRunLoopGetMain(),
@@ -1429,12 +1511,9 @@ private final class InputAccessibilityObserver {
     func stop() {
         guard let observer else { return }
 
+        removeObservedWindowNotifications(from: observer)
         if let applicationElement {
-            for notification in [
-                kAXFocusedUIElementChangedNotification,
-                kAXFocusedWindowChangedNotification,
-                kAXWindowCreatedNotification
-            ] {
+            for notification in Self.applicationNotifications {
                 _ = AXObserverRemoveNotification(
                     observer,
                     applicationElement,
@@ -1450,21 +1529,84 @@ private final class InputAccessibilityObserver {
         )
         self.observer = nil
         applicationElement = nil
+        observedWindowElement = nil
+        hasCompleteApplicationNotificationRegistration = false
+        hasCompleteNotificationRegistration = false
     }
 
-    fileprivate func accessibilityContextChanged() {
+    fileprivate func accessibilityContextChanged(notification: String) {
+        if notification == (kAXFocusedWindowChangedNotification as String),
+           let observer,
+           let applicationElement {
+            removeObservedWindowNotifications(from: observer)
+            let context = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+            let windowHasContentCoverage = observeFocusedWindowContent(
+                observer: observer,
+                applicationElement: applicationElement,
+                context: context
+            )
+            hasCompleteNotificationRegistration = hasCompleteApplicationNotificationRegistration
+                && windowHasContentCoverage
+            notificationReliability = .unproven
+        } else if Self.windowContentNotifications.contains(notification) {
+            notificationReliability = AIContextRefreshPolicy.notificationReliability(
+                registrationComplete: hasCompleteNotificationRegistration,
+                observedContentNotification: true
+            )
+        }
         onChange()
+    }
+
+    private func observeFocusedWindowContent(
+        observer: AXObserver,
+        applicationElement: AXUIElement,
+        context: UnsafeMutableRawPointer
+    ) -> Bool {
+        var reference: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            applicationElement,
+            kAXFocusedWindowAttribute as CFString,
+            &reference
+        ) == .success,
+              let reference,
+              CFGetTypeID(reference) == AXUIElementGetTypeID() else {
+            return false
+        }
+        let windowElement = reference as! AXUIElement
+        observedWindowElement = windowElement
+        let results = Self.windowContentNotifications.map { notification in
+            AXObserverAddNotification(
+                observer,
+                windowElement,
+                notification as CFString,
+                context
+            )
+        }
+        return results.allSatisfy { $0 == .success }
+    }
+
+    private func removeObservedWindowNotifications(from observer: AXObserver) {
+        guard let observedWindowElement else { return }
+        for notification in Self.windowContentNotifications {
+            _ = AXObserverRemoveNotification(
+                observer,
+                observedWindowElement,
+                notification as CFString
+            )
+        }
+        self.observedWindowElement = nil
     }
 }
 
 private let inputAccessibilityObserverCallback: AXObserverCallback = {
-    _, _, _, context in
+    _, _, notification, context in
     guard let context else { return }
     let observer = Unmanaged<InputAccessibilityObserver>
         .fromOpaque(context)
         .takeUnretainedValue()
+    let notificationName = notification as String
     MainActor.assumeIsolated {
-        observer.accessibilityContextChanged()
+        observer.accessibilityContextChanged(notification: notificationName)
     }
 }
 

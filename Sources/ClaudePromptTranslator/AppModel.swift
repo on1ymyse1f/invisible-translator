@@ -1,4 +1,5 @@
 import AppKit
+import CoreVideo
 import SwiftUI
 
 enum PrivacyPreferenceGate {
@@ -194,6 +195,22 @@ final class AppModel: ObservableObject {
     @Published var subtitleTranslationText = ""
     @Published var subtitleStatus = "未启动"
     @Published var subtitleTargetLanguageName = "自动"
+    @Published var subtitleRecognitionMode: SubtitleRecognitionMode = .regionOCR {
+        didSet {
+            UserDefaults.standard.set(
+                subtitleRecognitionMode.rawValue,
+                forKey: DefaultsKey.subtitleRecognitionMode
+            )
+        }
+    }
+    @Published var subtitleSpeechLocale: SubtitleSpeechLocale = .system {
+        didSet {
+            UserDefaults.standard.set(
+                subtitleSpeechLocale.rawValue,
+                forKey: DefaultsKey.subtitleSpeechLocale
+            )
+        }
+    }
     @Published var subtitleDisplayMode: SubtitleDisplayMode = .bilingual {
         didSet {
             UserDefaults.standard.set(subtitleDisplayMode.rawValue, forKey: DefaultsKey.subtitleDisplayMode)
@@ -252,8 +269,10 @@ final class AppModel: ObservableObject {
     private let selectionReader = UniversalSelectionReader()
     private let hoverReader = HoverTextReader()
     private let screenRegionOCRService = ScreenRegionOCRService()
+    private let subtitleSpeechSession = SubtitleSpeechSession()
     private let subtitleTranslationCache = SubtitleTranslationCache()
     private lazy var subtitlePipeline = LiveSubtitlePipeline(
+        cache: subtitleTranslationCache,
         targetResolver: { text in
             // Cue recognition runs outside the main actor. Keep routing pure;
             // presentation can still apply UI-owned learned preferences.
@@ -316,7 +335,12 @@ final class AppModel: ObservableObject {
     private var screenOCRTask: Task<Void, Never>?
     private var subtitleTask: Task<Void, Never>?
     private var subtitleCaptureTask: Task<Void, Never>?
+    private var subtitleCaptureStream: SubtitleCaptureStream?
     private var subtitleEventTask: Task<Void, Never>?
+    private var subtitleSpeechEventTask: Task<Void, Never>?
+    private var subtitleSpeechShutdownTask: Task<Void, Never>?
+    private var subtitlePipelineShutdownTask: Task<Void, Never>?
+    private var subtitleSessionGeneration: UInt64 = 0
     private var subtitleSequence: UInt64 = 0
     private var inputTranslationTask: Task<Void, Never>?
     private var inputTranslationGeneration: UInt64 = 0
@@ -450,6 +474,12 @@ final class AppModel: ObservableObject {
 
         self.subtitleDisplayMode = UserDefaults.standard.string(forKey: DefaultsKey.subtitleDisplayMode)
             .flatMap(SubtitleDisplayMode.init(rawValue:)) ?? .bilingual
+        self.subtitleRecognitionMode = UserDefaults.standard.string(
+            forKey: DefaultsKey.subtitleRecognitionMode
+        ).flatMap(SubtitleRecognitionMode.init(rawValue:)) ?? .regionOCR
+        self.subtitleSpeechLocale = UserDefaults.standard.string(
+            forKey: DefaultsKey.subtitleSpeechLocale
+        ).flatMap(SubtitleSpeechLocale.init(rawValue:)) ?? .system
         self.subtitleOverlayStyle = UserDefaults.standard.string(forKey: DefaultsKey.subtitleOverlayStyle)
             .flatMap(SubtitleOverlayStyle.init(rawValue:)) ?? .dark
         let savedSubtitleFontSize = UserDefaults.standard.double(forKey: DefaultsKey.subtitleFontSize)
@@ -1139,6 +1169,11 @@ final class AppModel: ObservableObject {
     }
 
     func stopSelectionMonitoring() {
+        if subtitleTranslationActive
+            || subtitleCaptureStream != nil
+            || subtitleSpeechEventTask != nil {
+            stopSubtitleTranslation(reconcileAfterStop: false)
+        }
         storedSelectionMonitor?.stop()
         storedHoverMonitor?.stop()
         storedSelectionMonitor = nil
@@ -1157,7 +1192,6 @@ final class AppModel: ObservableObject {
         hoverCaptureTask = nil
         screenOCRTask = nil
         subtitleTask = nil
-        subtitleTranslationActive = false
         responseSelectionExpiryTask?.cancel()
         responseSelectionExpiryTask = nil
         recentResponseSelectionSnapshot = nil
@@ -1247,6 +1281,17 @@ final class AppModel: ObservableObject {
     }
 
     func startSubtitleTranslation() {
+        switch subtitleRecognitionMode {
+        case .regionOCR:
+            startRegionOCRSubtitleTranslation()
+        case .systemSpeech:
+            startSystemSpeechSubtitleTranslation()
+        case .offlineASRModel:
+            statusMessage = "私有 ASR 引擎尚未安装；请选择区域 OCR 或 Apple 设备端语音。"
+        }
+    }
+
+    private func startRegionOCRSubtitleTranslation() {
         guard translatorEnabled else {
             statusMessage = "翻译器已暂停。"
             return
@@ -1266,6 +1311,8 @@ final class AppModel: ObservableObject {
         }
 
         stopSubtitleTranslation()
+        let appGeneration = subtitleSessionGeneration
+        let previousPipelineShutdown = subtitlePipelineShutdownTask
         subtitleStatus = "请框选视频中的字幕区域"
         let suggestedRegion = ScreenRegionSelection.frontmostWindow(of: sourceApp)
         subtitleTask = Task { [weak self] in
@@ -1273,15 +1320,23 @@ final class AppModel: ObservableObject {
             guard let region = await screenRegionSelectionController.selectRegion(
                 suggestedRegion: suggestedRegion
             ),
-                  !Task.isCancelled else {
-                subtitleStatus = "已取消"
+                  !Task.isCancelled,
+                  subtitleSessionGeneration == appGeneration else {
+                if subtitleSessionGeneration == appGeneration {
+                    subtitleStatus = "已取消"
+                }
                 return
             }
-            guard isCaptureAllowed(in: sourceApp) else {
+            guard subtitleSessionGeneration == appGeneration,
+                  isCaptureAllowed(in: sourceApp) else {
                 subtitleStatus = privacyBlockedMessage(for: sourceApp)
                 return
             }
 
+            await previousPipelineShutdown?.value
+            guard !Task.isCancelled,
+                  subtitleSessionGeneration == appGeneration,
+                  isCaptureAllowed(in: sourceApp) else { return }
             sourceApp.activate()
             subtitleTranslationActive = true
             reconcileRuntime(foregroundApplication: sourceApp)
@@ -1290,49 +1345,188 @@ final class AppModel: ObservableObject {
             subtitleStatus = "本机 OCR 监听中"
             subtitleOverlayController.show(region: region)
             let session = await subtitlePipeline.start()
+            guard !Task.isCancelled,
+                  subtitleSessionGeneration == appGeneration,
+                  subtitleTranslationActive,
+                  isCaptureAllowed(in: sourceApp) else {
+                await subtitlePipeline.stop(generation: session.generation)
+                return
+            }
             startSubtitleEventConsumption(
                 session: session,
-                sourceApplication: sourceApp
+                sourceApplication: sourceApp,
+                appGeneration: appGeneration
             )
             startSubtitleFrameProduction(
                 region: region,
                 sourceApplication: sourceApp,
-                generation: session.generation
+                generation: session.generation,
+                appGeneration: appGeneration
             )
+        }
+    }
+
+    private func startSystemSpeechSubtitleTranslation() {
+        guard translatorEnabled else {
+            statusMessage = "翻译器已暂停。"
+            return
+        }
+        guard ScreenRecordingPermission.requestIfNeeded() else {
+            statusMessage = "设备端语音字幕需要屏幕录制权限来捕获你明确选择的 App 音频。"
+            return
+        }
+        guard let sourceApp = NSWorkspace.shared.frontmostApplication,
+              !isHelperApp(sourceApp),
+              !sourceApp.isTerminated else {
+            statusMessage = "请先切换到正在播放视频的应用。"
+            return
+        }
+        guard isCaptureAllowed(in: sourceApp) else {
+            statusMessage = privacyBlockedMessage(for: sourceApp)
+            return
+        }
+        guard let overlayRegion = ScreenRegionSelection.frontmostWindow(of: sourceApp) else {
+            statusMessage = "无法确定目标 App 窗口；未启动音频捕获。"
+            return
+        }
+
+        stopSubtitleTranslation()
+        let appGeneration = subtitleSessionGeneration
+        subtitleTranslationActive = true
+        reconcileRuntime(foregroundApplication: sourceApp)
+        subtitleSourceText = ""
+        subtitleTranslationText = ""
+        subtitleStatus = "正在准备 Apple 设备端语音识别…"
+        subtitleOverlayController.show(region: overlayRegion)
+
+        let previousSpeechShutdown = subtitleSpeechShutdownTask
+        let previousPipelineShutdown = subtitlePipelineShutdownTask
+        subtitleTask = Task { [weak self] in
+            guard let self else { return }
+            await previousSpeechShutdown?.value
+            await previousPipelineShutdown?.value
+            guard !Task.isCancelled,
+                  subtitleSessionGeneration == appGeneration,
+                  subtitleTranslationActive,
+                  isCaptureAllowed(in: sourceApp) else { return }
+            let pipelineSession = await subtitlePipeline.start()
+            guard !Task.isCancelled,
+                  subtitleSessionGeneration == appGeneration,
+                  subtitleTranslationActive,
+                  isCaptureAllowed(in: sourceApp) else {
+                await subtitlePipeline.stop(generation: pipelineSession.generation)
+                return
+            }
+            startSubtitleEventConsumption(
+                session: pipelineSession,
+                sourceApplication: sourceApp,
+                appGeneration: appGeneration
+            )
+
+            do {
+                let speechHandle = try await subtitleSpeechSession.start(
+                    sourceApplication: sourceApp,
+                    localeIdentifier: subtitleSpeechLocale.localeIdentifier,
+                    authorizationCheck: { [weak self] in
+                        self?.subtitleSessionGeneration == appGeneration
+                            && self?.subtitleTranslationActive == true
+                            && ScreenRecordingPermission.isGranted
+                            && self?.isCaptureAllowed(in: sourceApp) == true
+                    }
+                )
+                guard !Task.isCancelled,
+                  subtitleSessionGeneration == appGeneration,
+                  subtitleTranslationActive,
+                  ScreenRecordingPermission.isGranted,
+                  isCaptureAllowed(in: sourceApp) else {
+                    await subtitleSpeechSession.cancel()
+                    return
+                }
+                startSubtitleSpeechEventConsumption(
+                    handle: speechHandle,
+                    pipelineGeneration: pipelineSession.generation,
+                    sourceApplication: sourceApp,
+                    appGeneration: appGeneration
+                )
+            } catch is CancellationError {
+                return
+            } catch {
+                guard subtitleSessionGeneration == appGeneration,
+                      subtitleTranslationActive else { return }
+                let message = (error as? LocalizedError)?.errorDescription
+                    ?? "无法启动设备端语音字幕。"
+                statusMessage = message
+                stopSubtitleTranslation()
+            }
         }
     }
 
     private func startSubtitleFrameProduction(
         region: ScreenRegionSelection,
         sourceApplication: NSRunningApplication,
-        generation: UInt64
+        generation: UInt64,
+        appGeneration: UInt64
     ) {
         subtitleCaptureTask?.cancel()
+        let previousStream = subtitleCaptureStream
+        subtitleCaptureStream = nil
+        if let previousStream {
+            Task { await previousStream.stop() }
+        }
         subtitleSequence = 0
         subtitleCaptureTask = Task { [weak self] in
             guard let self else { return }
             var previousFingerprint: UInt64?
             var nextInterval = LiveSubtitleCadencePolicy.dynamicInterval
-            while !Task.isCancelled,
+            var appliedStreamInterval = nextInterval
+            let captureStream: SubtitleCaptureStream
+            do {
+                captureStream = try await screenRegionOCRService.startSubtitleCaptureStream(
+                    region: region,
+                    sourceApplication: sourceApplication,
+                    authorizationCheck: { [weak self] in
+                        self?.subtitleSessionGeneration == appGeneration
+                            && self?.subtitleTranslationActive == true
+                            && ScreenRecordingPermission.isGranted
+                            && self?.isCaptureAllowed(in: sourceApplication) == true
+                    }
+                )
+            } catch is CancellationError {
+                return
+            } catch {
+                guard subtitleSessionGeneration == appGeneration,
+                      subtitleTranslationActive else { return }
+                let message = error.localizedDescription
+                stopSubtitleTranslation()
+                subtitleStatus = "已停止：\(message)"
+                return
+            }
+            guard !Task.isCancelled,
+                  subtitleSessionGeneration == appGeneration,
                   subtitleTranslationActive,
+                  ScreenRecordingPermission.isGranted,
+                  isCaptureAllowed(in: sourceApplication) else {
+                await captureStream.stop()
+                return
+            }
+            subtitleCaptureStream = captureStream
+            while !Task.isCancelled,
+                  subtitleSessionGeneration == appGeneration,
+                  subtitleTranslationActive,
+                  ScreenRecordingPermission.isGranted,
                   isCaptureAllowed(in: sourceApplication) {
                 let intervalStart = ContinuousClock.now
-                do {
-                    let image = try await screenRegionOCRService.captureSubtitleFrame(
-                        region: region,
-                        sourceApplication: sourceApplication,
-                        authorizationCheck: { [weak self] in
-                            self?.isCaptureAllowed(in: sourceApplication) == true
-                        }
-                    )
+                if let pixelBuffer = captureStream.takeLatestPixelBuffer() {
                     guard !Task.isCancelled,
+                          subtitleSessionGeneration == appGeneration,
                           subtitleTranslationActive,
+                          ScreenRecordingPermission.isGranted,
                           isCaptureAllowed(in: sourceApplication) else { break }
                     subtitleSequence &+= 1
-                    let fingerprint = Self.subtitleFrameFingerprint(image)
+                    let fingerprint = Self.subtitleFrameFingerprint(pixelBuffer)
                     let frame = LiveSubtitleFrame(
                         sequence: subtitleSequence,
-                        image: image,
+                        pixelBuffer: pixelBuffer,
                         hasVisualChange: previousFingerprint != fingerprint
                     )
                     previousFingerprint = fingerprint
@@ -1342,13 +1536,36 @@ final class AppModel: ObservableObject {
                     )
                     guard submission.accepted else { break }
                     nextInterval = submission.recommendedCaptureInterval
-                } catch is CancellationError {
-                    break
-                } catch {
-                    guard subtitleTranslationActive else { break }
-                    subtitleStatus = error.localizedDescription
-                    storedSubtitleOverlayController?.refresh()
-                    nextInterval = LiveSubtitleCadencePolicy.staticInterval
+                    if abs(appliedStreamInterval - nextInterval) > 0.001 {
+                        do {
+                            try await captureStream.updateMinimumFrameInterval(nextInterval)
+                            appliedStreamInterval = nextInterval
+                        } catch {
+                            guard !Task.isCancelled else { break }
+                            // Capture can continue at its prior bounded cadence;
+                            // a configuration update failure is not permission
+                            // to rebuild a broader stream.
+                        }
+                    }
+                } else {
+                    if let terminal = captureStream.terminal {
+                        if terminal.requiresApplicationShutdown {
+                            // `stopSubtitleTranslation` does not await
+                            // captureTask, so invoking it here cannot self-wait;
+                            // it synchronously flips active to false, takes this
+                            // stream for asynchronous stop, and releases the
+                            // overlay/pipeline resources.
+                            let message = terminal.statusMessage
+                            guard subtitleSessionGeneration == appGeneration else { return }
+                            stopSubtitleTranslation()
+                            subtitleStatus = "已停止：\(message)"
+                            return
+                        }
+                        break
+                    }
+                    // Wait briefly for the first stream callback without
+                    // turning an empty slot into a busy loop.
+                    nextInterval = min(nextInterval, 0.05)
                 }
                 let elapsed = intervalStart.duration(to: ContinuousClock.now)
                 let requestedDelay = Duration.milliseconds(Int64(nextInterval * 1_000)) - elapsed
@@ -1356,19 +1573,32 @@ final class AppModel: ObservableObject {
                     try? await Task.sleep(for: requestedDelay)
                 }
             }
+            await captureStream.stop()
+            if subtitleCaptureStream === captureStream {
+                subtitleCaptureStream = nil
+            }
+            if subtitleSessionGeneration == appGeneration,
+               subtitleTranslationActive,
+               (!ScreenRecordingPermission.isGranted
+                   || !isCaptureAllowed(in: sourceApplication)) {
+                stopSubtitleTranslation()
+            }
         }
     }
 
     private func startSubtitleEventConsumption(
         session: LiveSubtitlePipelineSession,
-        sourceApplication: NSRunningApplication
+        sourceApplication: NSRunningApplication,
+        appGeneration: UInt64
     ) {
         subtitleEventTask?.cancel()
         subtitleEventTask = Task { [weak self] in
             guard let self else { return }
             for await event in session.events {
                 guard !Task.isCancelled,
+                      subtitleSessionGeneration == appGeneration,
                       subtitleTranslationActive,
+                      ScreenRecordingPermission.isGranted,
                       isCaptureAllowed(in: sourceApplication) else { break }
                 switch event {
                 case .recognized:
@@ -1382,9 +1612,12 @@ final class AppModel: ObservableObject {
                 case .translated(_, _, let sourceText, let output, let cacheHit):
                     subtitleSourceText = sourceText
                     subtitleTranslationText = output.text
+                    let sourceName = subtitleRecognitionMode == .systemSpeech
+                        ? "设备端语音"
+                        : "区域 OCR"
                     subtitleStatus = cacheHit
-                        ? "\(output.providerName) · 本机缓存 · 区域 OCR"
-                        : "\(output.providerName) · 区域 OCR"
+                        ? "\(output.providerName) · 本机缓存 · \(sourceName)"
+                        : "\(output.providerName) · \(sourceName)"
                 case .recognitionFailed(_, _, let message),
                      .translationFailed(_, _, let message):
                     subtitleStatus = message
@@ -1396,15 +1629,83 @@ final class AppModel: ObservableObject {
         }
     }
 
-    nonisolated private static func subtitleFrameFingerprint(_ image: CGImage) -> UInt64 {
+    private func startSubtitleSpeechEventConsumption(
+        handle: SubtitleSpeechSessionHandle,
+        pipelineGeneration: UInt64,
+        sourceApplication: NSRunningApplication,
+        appGeneration: UInt64
+    ) {
+        subtitleSpeechEventTask?.cancel()
+        subtitleSequence = 0
+        subtitleSpeechEventTask = Task { [weak self] in
+            guard let self else { return }
+            var receivedExpectedTerminalEvent = false
+            for await event in handle.events {
+                guard !Task.isCancelled,
+                      subtitleSessionGeneration == appGeneration,
+                      subtitleTranslationActive,
+                      ScreenRecordingPermission.isGranted,
+                      isCaptureAllowed(in: sourceApplication) else { break }
+                switch event {
+                case .started(_, let engine):
+                    subtitleStatus = engine == .speechAnalyzer
+                        ? "Apple SpeechAnalyzer 本机监听中"
+                        : "Apple 设备端语音监听中"
+                case .partial(_, let text):
+                    subtitleSequence &+= 1
+                    _ = await subtitlePipeline.submitRecognizedText(
+                        text,
+                        sequence: subtitleSequence,
+                        generation: pipelineGeneration
+                    )
+                    guard subtitleSessionGeneration == appGeneration else { return }
+                case .final(_, let text):
+                    subtitleSequence &+= 1
+                    _ = await subtitlePipeline.submitRecognizedText(
+                        text,
+                        sequence: subtitleSequence,
+                        generation: pipelineGeneration,
+                        isFinal: true
+                    )
+                    guard subtitleSessionGeneration == appGeneration else { return }
+                case .failed(_, let message):
+                    // A recognizer failure is terminal for the explicit audio
+                    // session. Stop every capture/recognition resource at once
+                    // instead of leaving target-App audio flowing until the
+                    // user notices the status and presses Stop.
+                    guard subtitleSessionGeneration == appGeneration else { return }
+                    stopSubtitleTranslation()
+                    subtitleStatus = "已停止：\(message)"
+                    return
+                case .stopped, .cancelled:
+                    receivedExpectedTerminalEvent = true
+                }
+                storedSubtitleOverlayController?.refresh()
+            }
+            guard !Task.isCancelled,
+                  subtitleSessionGeneration == appGeneration,
+                  subtitleTranslationActive,
+                  (!receivedExpectedTerminalEvent || !isCaptureAllowed(in: sourceApplication)) else {
+                return
+            }
+            stopSubtitleTranslation()
+        }
+    }
+
+    nonisolated private static func subtitleFrameFingerprint(_ pixelBuffer: CVPixelBuffer) -> UInt64 {
         // A small deterministic sample is sufficient for cadence selection; it
         // is not persisted and never leaves the process.
-        var fingerprint = UInt64(image.width) &* 1_099_511_628_211
-        fingerprint ^= UInt64(image.height)
-        guard let dataProvider = image.dataProvider,
-              let data = dataProvider.data else { return fingerprint }
-        let length = CFDataGetLength(data)
-        guard length > 0, let bytes = CFDataGetBytePtr(data) else { return fingerprint }
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        var fingerprint = UInt64(width) &* 1_099_511_628_211
+        fingerprint ^= UInt64(height)
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return fingerprint }
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let length = max(bytesPerRow * height, 0)
+        guard length > 0 else { return fingerprint }
+        let bytes = baseAddress.assumingMemoryBound(to: UInt8.self)
         let sampleCount = min(64, length)
         for index in 0..<sampleCount {
             let offset = index * max(length / sampleCount, 1)
@@ -1415,14 +1716,33 @@ final class AppModel: ObservableObject {
     }
 
     func stopSubtitleTranslation(reconcileAfterStop: Bool = true) {
+        // Invalidate every authorization closure synchronously before any
+        // asynchronous SCStream shutdown work is scheduled.
+        subtitleSessionGeneration &+= 1
+        subtitleTranslationActive = false
         subtitleTask?.cancel()
         subtitleTask = nil
         subtitleCaptureTask?.cancel()
         subtitleCaptureTask = nil
+        let captureStream = subtitleCaptureStream
+        subtitleCaptureStream = nil
+        if let captureStream {
+            Task { await captureStream.stop() }
+        }
         subtitleEventTask?.cancel()
         subtitleEventTask = nil
-        Task { await subtitlePipeline.stop() }
-        subtitleTranslationActive = false
+        subtitleSpeechEventTask?.cancel()
+        subtitleSpeechEventTask = nil
+        let previousSpeechShutdown = subtitleSpeechShutdownTask
+        subtitleSpeechShutdownTask = Task { [subtitleSpeechSession] in
+            await previousSpeechShutdown?.value
+            await subtitleSpeechSession.cancel()
+        }
+        let previousPipelineShutdown = subtitlePipelineShutdownTask
+        subtitlePipelineShutdownTask = Task { [subtitlePipeline] in
+            await previousPipelineShutdown?.value
+            await subtitlePipeline.stop()
+        }
         storedScreenRegionSelectionController?.cancel()
         storedScreenRegionSelectionController = nil
         storedSubtitleOverlayController?.hide()
@@ -2229,6 +2549,8 @@ private enum DefaultsKey {
     static let automaticSelectionTranslationPrivacyAcknowledged = "automaticSelectionTranslationPrivacyAcknowledged"
     static let hoverTranslationEnabled = "hoverTranslationEnabled"
     static let subtitleDisplayMode = "subtitleDisplayMode"
+    static let subtitleRecognitionMode = "subtitleRecognitionMode"
+    static let subtitleSpeechLocale = "subtitleSpeechLocale"
     static let subtitleOverlayStyle = "subtitleOverlayStyle"
     static let subtitleFontSize = "subtitleFontSize"
     static let selectionDisplayMode = "selectionDisplayMode"

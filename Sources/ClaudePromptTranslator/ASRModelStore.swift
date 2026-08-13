@@ -1,5 +1,138 @@
 import CryptoKit
+import Darwin
 import Foundation
+
+/// Validates app-owned directory paths without resolving or following symbolic
+/// links. The boundary is fixed by the caller; every existing component from
+/// that boundary through the target is inspected with `lstat` before any
+/// enumeration, removal, or file creation is allowed.
+enum SecureOwnedDirectoryChain {
+    enum ValidationError: Error, Equatable {
+        case targetOutsideBoundary
+        case boundaryMissing
+        case symbolicLink(URL)
+        case notDirectory(URL)
+        case inspectionFailed(URL, Int32)
+    }
+
+    static func validateExistingDirectory(
+        from boundaryURL: URL,
+        through targetURL: URL
+    ) throws -> Bool {
+        let chain = try directoryChain(from: boundaryURL, through: targetURL)
+
+        for (index, url) in chain.enumerated() {
+            switch try itemKind(at: url) {
+            case .directory:
+                continue
+            case .missing where index == 0:
+                throw ValidationError.boundaryMissing
+            case .missing:
+                return false
+            case .symbolicLink:
+                throw ValidationError.symbolicLink(url)
+            case .other:
+                throw ValidationError.notDirectory(url)
+            }
+        }
+        return true
+    }
+
+    static func createDirectoryIfNeeded(
+        from boundaryURL: URL,
+        through targetURL: URL,
+        fileManager: FileManager,
+        permissions: Int16 = 0o700
+    ) throws {
+        let chain = try directoryChain(from: boundaryURL, through: targetURL)
+
+        for (index, url) in chain.enumerated() {
+            switch try itemKind(at: url) {
+            case .directory:
+                continue
+            case .missing where index == 0:
+                throw ValidationError.boundaryMissing
+            case .missing:
+                do {
+                    try fileManager.createDirectory(
+                        at: url,
+                        withIntermediateDirectories: false,
+                        attributes: [.posixPermissions: NSNumber(value: permissions)]
+                    )
+                } catch {
+                    // A concurrent creator is acceptable only if a fresh
+                    // lstat proves that the exact component is a directory.
+                    guard try itemKind(at: url) == .directory else { throw error }
+                }
+                guard try itemKind(at: url) == .directory else {
+                    throw ValidationError.notDirectory(url)
+                }
+            case .symbolicLink:
+                throw ValidationError.symbolicLink(url)
+            case .other:
+                throw ValidationError.notDirectory(url)
+            }
+        }
+
+        guard try validateExistingDirectory(from: boundaryURL, through: targetURL) else {
+            throw ValidationError.notDirectory(targetURL.standardizedFileURL)
+        }
+    }
+
+    private enum ItemKind: Equatable {
+        case missing
+        case directory
+        case symbolicLink
+        case other
+    }
+
+    private static func directoryChain(
+        from boundaryURL: URL,
+        through targetURL: URL
+    ) throws -> [URL] {
+        let boundary = boundaryURL.standardizedFileURL
+        let target = targetURL.standardizedFileURL
+        guard boundary.isFileURL, target.isFileURL else {
+            throw ValidationError.targetOutsideBoundary
+        }
+
+        let boundaryComponents = boundary.pathComponents
+        let targetComponents = target.pathComponents
+        guard targetComponents.count >= boundaryComponents.count,
+              Array(targetComponents.prefix(boundaryComponents.count)) == boundaryComponents else {
+            throw ValidationError.targetOutsideBoundary
+        }
+
+        var chain = [boundary]
+        var current = boundary
+        for component in targetComponents.dropFirst(boundaryComponents.count) {
+            current.appendPathComponent(component, isDirectory: true)
+            chain.append(current.standardizedFileURL)
+        }
+        return chain
+    }
+
+    private static func itemKind(at url: URL) throws -> ItemKind {
+        var information = stat()
+        errno = 0
+        if lstat(url.path, &information) == 0 {
+            switch information.st_mode & S_IFMT {
+            case S_IFDIR:
+                return .directory
+            case S_IFLNK:
+                return .symbolicLink
+            default:
+                return .other
+            }
+        }
+
+        let failure = errno
+        if failure == ENOENT || failure == ENOTDIR {
+            return .missing
+        }
+        throw ValidationError.inspectionFailed(url, failure)
+    }
+}
 
 enum SubtitleRecognitionMode: String, CaseIterable, Codable, Sendable {
     case regionOCR
@@ -65,6 +198,7 @@ enum ASRModelStoreError: LocalizedError, Equatable {
     case digestMismatch
     case signatureMismatch
     case metadataInvalid
+    case installationInProgress
 
     var errorDescription: String? {
         switch self {
@@ -102,6 +236,8 @@ enum ASRModelStoreError: LocalizedError, Equatable {
             return "模型 Ed25519 验签失败。"
         case .metadataInvalid:
             return "模型安装记录无效。"
+        case .installationInProgress:
+            return "另一个模型安装正在进行；当前操作已拒绝。"
         }
     }
 }
@@ -428,36 +564,54 @@ actor ASRModelStore {
     }
 
     private let rootDirectory: URL
+    private let applicationSupportBoundary: URL
     private let metadataURL: URL
     private let verifier: any ASRModelVerifying
     private let fileManager: FileManager
     private var currentStatus: ASRModelInstallationStatus = .notInstalled
+    private var installationInProgress = false
 
     init(
         rootDirectory: URL = ASRModelStore.defaultRootDirectory(),
         verifier: any ASRModelVerifying,
         fileManager: FileManager = .default
     ) {
-        self.rootDirectory = rootDirectory.standardizedFileURL
-        self.metadataURL = rootDirectory
-            .standardizedFileURL
+        let standardizedRoot = rootDirectory.standardizedFileURL
+        self.rootDirectory = standardizedRoot
+        if standardizedRoot.lastPathComponent == "ASRModels",
+           standardizedRoot.deletingLastPathComponent().lastPathComponent == "ClaudePromptTranslator" {
+            self.applicationSupportBoundary = standardizedRoot
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .standardizedFileURL
+        } else {
+            // Custom roots are used by tests and embedding clients. Their
+            // fixed lexical parent is the narrowest boundary available.
+            self.applicationSupportBoundary = standardizedRoot
+                .deletingLastPathComponent()
+                .standardizedFileURL
+        }
+        self.metadataURL = standardizedRoot
             .appendingPathComponent("current.json", isDirectory: false)
         self.verifier = verifier
         self.fileManager = fileManager
     }
 
     func status(now: Date = Date()) -> ASRModelInstallationStatus {
+        // `install` yields while downloading and verifying. During that actor
+        // reentrancy window, status checks must remain observational: cleaning
+        // an expired prior model here would break the atomic replacement
+        // contract while the new model is still in flight.
+        if installationInProgress { return currentStatus }
         do {
             try prepareRootDirectory()
             _ = try cleanupExpired(now: now)
-            if case .downloading = currentStatus { return currentStatus }
-            if case .verifying = currentStatus { return currentStatus }
             if case .failed = currentStatus { return currentStatus }
             guard let record = try loadRecord() else {
                 currentStatus = .notInstalled
                 return currentStatus
             }
-            guard installedFileURL(for: record) != nil else {
+            guard try installedFileURL(for: record) != nil else {
                 currentStatus = .notInstalled
                 return currentStatus
             }
@@ -478,6 +632,12 @@ actor ASRModelStore {
         using downloadClient: ASRModelDownloadClient,
         now: Date = Date()
     ) async throws -> URL {
+        guard !installationInProgress else {
+            throw ASRModelStoreError.installationInProgress
+        }
+        installationInProgress = true
+        defer { installationInProgress = false }
+
         do {
             try Self.validate(descriptor)
             try prepareRootDirectory()
@@ -532,7 +692,8 @@ actor ASRModelStore {
                 throw error
             }
 
-            if let previousURL = previousRecord.flatMap(installedFileURL(for:)),
+            if let previousRecord,
+               let previousURL = try installedFileURL(for: previousRecord),
                previousURL != installedURL {
                 try? fileManager.removeItem(at: previousURL)
             }
@@ -551,14 +712,19 @@ actor ASRModelStore {
 
     func installedModelURL(now: Date = Date()) throws -> URL? {
         try prepareRootDirectory()
-        _ = try cleanupExpired(now: now)
+        if !installationInProgress {
+            _ = try cleanupExpired(now: now)
+        }
         guard let record = try loadRecord() else { return nil }
-        return installedFileURL(for: record)
+        return try installedFileURL(for: record)
     }
 
     func markUsed(at date: Date = Date()) throws {
+        guard !installationInProgress else {
+            throw ASRModelStoreError.installationInProgress
+        }
         try prepareRootDirectory()
-        guard var record = try loadRecord(), installedFileURL(for: record) != nil else { return }
+        guard var record = try loadRecord(), try installedFileURL(for: record) != nil else { return }
         record.lastUsedAt = date
         try saveRecord(record)
         currentStatus = .installed(
@@ -569,8 +735,11 @@ actor ASRModelStore {
     }
 
     func setKeepDownloaded(_ keepDownloaded: Bool) throws {
+        guard !installationInProgress else {
+            throw ASRModelStoreError.installationInProgress
+        }
         try prepareRootDirectory()
-        guard var record = try loadRecord(), installedFileURL(for: record) != nil else { return }
+        guard var record = try loadRecord(), try installedFileURL(for: record) != nil else { return }
         record.keepDownloaded = keepDownloaded
         try saveRecord(record)
         currentStatus = .installed(
@@ -582,14 +751,18 @@ actor ASRModelStore {
 
     @discardableResult
     func performAutomaticCleanup(now: Date = Date()) throws -> Bool {
+        guard !installationInProgress else { return false }
         try prepareRootDirectory()
         return try cleanupExpired(now: now)
     }
 
     func removeInstalledModel() throws {
+        guard !installationInProgress else {
+            throw ASRModelStoreError.installationInProgress
+        }
         try prepareRootDirectory()
         let record = try loadRecord()
-        if let url = record.flatMap(installedFileURL(for:)) {
+        if let record, let url = try installedFileURL(for: record) {
             try? fileManager.removeItem(at: url)
         }
         if fileManager.fileExists(atPath: metadataURL.path) {
@@ -615,7 +788,7 @@ actor ASRModelStore {
             try removeOrphanedModels(keeping: nil)
             return false
         }
-        guard installedFileURL(for: record) != nil else {
+        guard try installedFileURL(for: record) != nil else {
             if fileManager.fileExists(atPath: metadataURL.path) {
                 try fileManager.removeItem(at: metadataURL)
             }
@@ -629,7 +802,7 @@ actor ASRModelStore {
             return false
         }
 
-        if let url = installedFileURL(for: record) {
+        if let url = try installedFileURL(for: record) {
             try fileManager.removeItem(at: url)
         }
         try fileManager.removeItem(at: metadataURL)
@@ -639,19 +812,36 @@ actor ASRModelStore {
     }
 
     private func prepareRootDirectory() throws {
-        try fileManager.createDirectory(
-            at: rootDirectory,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: NSNumber(value: Int16(0o700))]
-        )
+        do {
+            try SecureOwnedDirectoryChain.createDirectoryIfNeeded(
+                from: applicationSupportBoundary,
+                through: rootDirectory,
+                fileManager: fileManager
+            )
+        } catch {
+            throw ASRModelStoreError.metadataInvalid
+        }
         try fileManager.setAttributes(
             [.posixPermissions: NSNumber(value: Int16(0o700))],
             ofItemAtPath: rootDirectory.path
         )
+        do {
+            guard try SecureOwnedDirectoryChain.validateExistingDirectory(
+                from: applicationSupportBoundary,
+                through: rootDirectory
+            ) else {
+                throw ASRModelStoreError.metadataInvalid
+            }
+        } catch {
+            throw ASRModelStoreError.metadataInvalid
+        }
     }
 
     private func loadRecord() throws -> InstalledRecord? {
-        guard fileManager.fileExists(atPath: metadataURL.path) else { return nil }
+        guard let metadataType = try itemTypeIfPresent(at: metadataURL) else { return nil }
+        guard metadataType == .typeRegular else {
+            throw ASRModelStoreError.metadataInvalid
+        }
         let data = try Data(contentsOf: metadataURL, options: [.mappedIfSafe])
         guard data.count <= 64 * 1_024,
               let record = try? JSONDecoder().decode(InstalledRecord.self, from: data),
@@ -667,17 +857,28 @@ actor ASRModelStore {
         guard data.count <= 64 * 1_024 else {
             throw ASRModelStoreError.metadataInvalid
         }
+        if let metadataType = try itemTypeIfPresent(at: metadataURL),
+           metadataType != .typeRegular {
+            throw ASRModelStoreError.metadataInvalid
+        }
         try data.write(to: metadataURL, options: [.atomic])
+        guard try itemTypeIfPresent(at: metadataURL) == .typeRegular else {
+            throw ASRModelStoreError.metadataInvalid
+        }
         try fileManager.setAttributes(
             [.posixPermissions: NSNumber(value: Int16(0o600))],
             ofItemAtPath: metadataURL.path
         )
     }
 
-    private func installedFileURL(for record: InstalledRecord) -> URL? {
+    private func installedFileURL(for record: InstalledRecord) throws -> URL? {
         guard Self.safeComponent(record.fileName) else { return nil }
         let url = rootDirectory.appendingPathComponent(record.fileName, isDirectory: false)
-        return fileManager.fileExists(atPath: url.path) ? url : nil
+        guard let type = try itemTypeIfPresent(at: url) else { return nil }
+        guard type == .typeRegular else {
+            throw ASRModelStoreError.metadataInvalid
+        }
+        return url
     }
 
     private func removeOrphanedModels(keeping fileName: String?) throws {
@@ -687,9 +888,24 @@ actor ASRModelStore {
             options: [.skipsHiddenFiles]
         )
         for url in urls where url.pathExtension == "cptasr" && url.lastPathComponent != fileName {
-            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
-            guard values.isRegularFile == true, values.isSymbolicLink != true else { continue }
+            guard try itemTypeIfPresent(at: url) == .typeRegular else { continue }
             try fileManager.removeItem(at: url)
+        }
+    }
+
+    /// `attributesOfItem` uses lstat-style type reporting for a symbolic link,
+    /// unlike `fileExists` and normal URL reads which can follow its target.
+    private func itemTypeIfPresent(at url: URL) throws -> FileAttributeType? {
+        do {
+            let attributes = try fileManager.attributesOfItem(atPath: url.path)
+            return attributes[.type] as? FileAttributeType
+        } catch {
+            let nsError = error as NSError
+            if nsError.domain == NSCocoaErrorDomain,
+               [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(nsError.code) {
+                return nil
+            }
+            throw error
         }
     }
 

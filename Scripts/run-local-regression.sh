@@ -87,6 +87,11 @@ wait_for_file() {
   [[ -s "${path}" ]]
 }
 
+screen_session_is_locked() {
+  /usr/sbin/ioreg -n Root -d1 2>/dev/null \
+    | /usr/bin/grep -q '"CGSSessionScreenIsLocked"=Yes'
+}
+
 field_value() {
   local key="$1"
   local path="$2"
@@ -408,6 +413,8 @@ if [[ ${RUN_UI} -eq 1 ]]; then
 
     if [[ ${HARNESS_READY} -eq 1 ]]; then
       record "synthetic-harness-ready" "PASS" "strict focused composer hash and window identity matched"
+    elif screen_session_is_locked; then
+      record "synthetic-harness-ready" "BLOCKED" "desktop session is locked; Accessibility UI inspection is unavailable"
     elif [[ "${READY_ERROR_CODE}" == "accessibility_permission_required" ]]; then
       record "synthetic-harness-ready" "BLOCKED" "debug self-test identity lacks Accessibility permission"
     else

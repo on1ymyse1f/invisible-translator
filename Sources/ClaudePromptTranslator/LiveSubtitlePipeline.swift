@@ -1,17 +1,30 @@
 import CoreGraphics
+import CoreVideo
 import Foundation
 
 /// A frame is retained only while Vision is processing it or while it is the
 /// single newest queued frame. It is never placed in the translation cache or
-/// emitted to observers.
+/// emitted to observers. Production capture supplies a CVPixelBuffer directly;
+/// the CGImage initializer remains solely for deterministic unit-test helpers.
 struct LiveSubtitleFrame: @unchecked Sendable {
     let sequence: UInt64
-    let image: CGImage
     let hasVisualChange: Bool
+    let pixelBuffer: CVPixelBuffer?
+    let testImage: CGImage?
 
+    init(sequence: UInt64, pixelBuffer: CVPixelBuffer, hasVisualChange: Bool = true) {
+        self.sequence = sequence
+        self.pixelBuffer = pixelBuffer
+        self.testImage = nil
+        self.hasVisualChange = hasVisualChange
+    }
+
+    /// Test-only compatibility path. The app's continuous subtitle capture
+    /// never creates a CGImage.
     init(sequence: UInt64, image: CGImage, hasVisualChange: Bool = true) {
         self.sequence = sequence
-        self.image = image
+        self.pixelBuffer = nil
+        self.testImage = image
         self.hasVisualChange = hasVisualChange
     }
 }
@@ -82,6 +95,7 @@ actor LiveSubtitlePipeline {
 
     private struct QueuedCue: Sendable {
         let generation: UInt64
+        let revision: UInt64
         let sequence: UInt64
         let text: String
         let target: TargetLanguage
@@ -99,6 +113,8 @@ actor LiveSubtitlePipeline {
     private var eventContinuation: AsyncStream<LiveSubtitlePipelineEvent>.Continuation?
     private var recognitionTask: Task<Void, Never>?
     private var translationTask: Task<Void, Never>?
+    private var cueProcessor = SubtitleCueProcessor()
+    private var latestCueRevision: UInt64 = 0
 
     init(
         cadencePolicy: LiveSubtitleCadencePolicy = LiveSubtitleCadencePolicy(),
@@ -121,6 +137,8 @@ actor LiveSubtitlePipeline {
         cadencePolicy = LiveSubtitleCadencePolicy(
             unchangedFramesBeforeStatic: cadencePolicy.unchangedFramesBeforeStatic
         )
+        cueProcessor = SubtitleCueProcessor()
+        latestCueRevision = 0
 
         let frameChannel = AsyncStream<LiveSubtitleFrame>.makeStream(
             bufferingPolicy: .bufferingNewest(1)
@@ -192,7 +210,36 @@ actor LiveSubtitlePipeline {
         cadencePolicy.recommendedInterval
     }
 
+    /// Feeds text produced by DOM captions or an explicit on-device speech
+    /// session into the same stabilisation, latest-wins translation, cache and
+    /// overlay event chain used by OCR. No audio or page object is retained.
+    @discardableResult
+    func submitRecognizedText(
+        _ text: String,
+        sequence: UInt64,
+        generation submittedGeneration: UInt64,
+        isFinal: Bool = false
+    ) -> Bool {
+        guard submittedGeneration == generation,
+              translationTask != nil else { return false }
+        handleRecognizedText(
+            text,
+            sequence: sequence,
+            generation: submittedGeneration,
+            isFinal: isFinal
+        )
+        return true
+    }
+
     func stop() async {
+        await stopCurrentSession(emitStopped: true)
+    }
+
+    /// Stops only the caller's session. A stale AppModel start must never stop
+    /// a replacement session that acquired the actor while the old start was
+    /// suspended.
+    func stop(generation expectedGeneration: UInt64) async {
+        guard generation == expectedGeneration else { return }
         await stopCurrentSession(emitStopped: true)
     }
 
@@ -200,28 +247,18 @@ actor LiveSubtitlePipeline {
         _ frames: AsyncStream<LiveSubtitleFrame>,
         generation sessionGeneration: UInt64
     ) async {
-        var cueProcessor = SubtitleCueProcessor()
         for await frame in frames {
             guard !Task.isCancelled, sessionGeneration == generation else { break }
             do {
                 let result = try await recognizer(frame)
                 try Task.checkCancellation()
                 guard sessionGeneration == generation else { continue }
-                eventContinuation?.yield(
-                    .recognized(
-                        generation: sessionGeneration,
-                        sequence: frame.sequence,
-                        text: result.text
-                    )
-                )
-                guard let cue = cueProcessor.observe(result.text) else { continue }
-                let queuedCue = QueuedCue(
-                    generation: sessionGeneration,
+                handleRecognizedText(
+                    result.text,
                     sequence: frame.sequence,
-                    text: cue,
-                    target: targetResolver(cue)
+                    generation: sessionGeneration,
+                    isFinal: false
                 )
-                cueContinuation?.yield(queuedCue)
             } catch is CancellationError {
                 break
             } catch {
@@ -237,6 +274,33 @@ actor LiveSubtitlePipeline {
         }
     }
 
+    private func handleRecognizedText(
+        _ text: String,
+        sequence: UInt64,
+        generation sessionGeneration: UInt64,
+        isFinal: Bool
+    ) {
+        guard sessionGeneration == generation else { return }
+        eventContinuation?.yield(
+            .recognized(
+                generation: sessionGeneration,
+                sequence: sequence,
+                text: text
+            )
+        )
+        guard let cue = cueProcessor.observe(text, isFinal: isFinal) else { return }
+        latestCueRevision &+= 1
+        cueContinuation?.yield(
+            QueuedCue(
+                generation: sessionGeneration,
+                revision: latestCueRevision,
+                sequence: sequence,
+                text: cue,
+                target: targetResolver(cue)
+            )
+        )
+    }
+
     private func consumeCues(
         _ cues: AsyncStream<QueuedCue>,
         generation sessionGeneration: UInt64
@@ -245,9 +309,11 @@ actor LiveSubtitlePipeline {
             guard !Task.isCancelled,
                   cue.generation == sessionGeneration,
                   sessionGeneration == generation else { break }
+            guard isLatest(cue, generation: sessionGeneration) else { continue }
 
             if let cached = await cache.value(for: cue.text, target: cue.target) {
-                guard !Task.isCancelled, sessionGeneration == generation else { continue }
+                guard !Task.isCancelled,
+                      isLatest(cue, generation: sessionGeneration) else { continue }
                 eventContinuation?.yield(
                     .translated(
                         generation: sessionGeneration,
@@ -260,6 +326,8 @@ actor LiveSubtitlePipeline {
                 continue
             }
 
+            guard !Task.isCancelled,
+                  isLatest(cue, generation: sessionGeneration) else { continue }
             eventContinuation?.yield(
                 .translationStarted(
                     generation: sessionGeneration,
@@ -270,9 +338,10 @@ actor LiveSubtitlePipeline {
             do {
                 let output = try await translator(cue.text, cue.target)
                 try Task.checkCancellation()
-                guard sessionGeneration == generation else { continue }
+                guard isLatest(cue, generation: sessionGeneration) else { continue }
                 await cache.insert(output, for: cue.text, target: cue.target)
-                guard !Task.isCancelled, sessionGeneration == generation else { continue }
+                guard !Task.isCancelled,
+                      isLatest(cue, generation: sessionGeneration) else { continue }
                 eventContinuation?.yield(
                     .translated(
                         generation: sessionGeneration,
@@ -285,7 +354,7 @@ actor LiveSubtitlePipeline {
             } catch is CancellationError {
                 break
             } catch {
-                guard sessionGeneration == generation else { continue }
+                guard isLatest(cue, generation: sessionGeneration) else { continue }
                 eventContinuation?.yield(
                     .translationFailed(
                         generation: sessionGeneration,
@@ -295,6 +364,15 @@ actor LiveSubtitlePipeline {
                 )
             }
         }
+    }
+
+    private func isLatest(
+        _ cue: QueuedCue,
+        generation sessionGeneration: UInt64
+    ) -> Bool {
+        cue.generation == sessionGeneration
+            && sessionGeneration == generation
+            && cue.revision == latestCueRevision
     }
 
     private func stopCurrentSession(emitStopped: Bool) async {
@@ -321,10 +399,20 @@ actor LiveSubtitlePipeline {
         _ frame: LiveSubtitleFrame
     ) async throws -> ScreenTextOCRResult {
         try Task.checkCancellation()
-        let result = try ScreenTextOCRRecognizer.recognize(
-            in: frame.image,
-            profile: .liveSubtitle
-        )
+        let result: ScreenTextOCRResult
+        if let pixelBuffer = frame.pixelBuffer {
+            result = try ScreenTextOCRRecognizer.recognize(
+                in: pixelBuffer,
+                profile: .liveSubtitle
+            )
+        } else if let testImage = frame.testImage {
+            result = try ScreenTextOCRRecognizer.recognize(
+                in: testImage,
+                profile: .liveSubtitle
+            )
+        } else {
+            throw ScreenTextOCRError.noTextRecognized
+        }
         try Task.checkCancellation()
         return result
     }

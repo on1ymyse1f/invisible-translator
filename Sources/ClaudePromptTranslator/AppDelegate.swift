@@ -37,6 +37,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private lazy var usageGuideController = UsageGuideController(model: model)
     private lazy var storagePerformanceController = StoragePerformanceController()
     private let updateCoordinator = UpdateCoordinator()
+    private var browserNativeBridgeServer: BrowserNativeBridgeServer?
+    private var browserAuthorizedOrigins = BrowserNativeDomainAuthorizationStore.load()
     private var updateDeadlineTask: Task<Void, Never>?
     private var updateReleaseTask: Task<Void, Never>?
     private let hotKeySignature = OSType(0x43505431) // "CPT1"
@@ -71,6 +73,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         existingInstanceAtLaunch = findExistingInstance()
+
+        if existingInstanceAtLaunch == nil, !browserAuthorizedOrigins.isEmpty {
+            configureBrowserNativeBridge()
+        }
 
         configureSingleInstanceObserver()
         configureStatusItem()
@@ -168,6 +174,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateDeadlineTask?.cancel()
         updateReleaseTask?.cancel()
         updateCoordinator.releaseUpdaterAfterCheck()
+        browserNativeBridgeServer?.stop()
+        browserNativeBridgeServer = nil
         model.stopSelectionMonitoring()
         model.dismissSelectionOverlay()
         model.stopUnifiedBar()
@@ -176,6 +184,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showInputPanel() {
         model.showPanel(reason: .manual)
+    }
+
+    private func configureBrowserNativeBridge() {
+        guard browserNativeBridgeServer == nil,
+              !browserAuthorizedOrigins.isEmpty else { return }
+        let automaticTranslator = AutomaticTranslationClient()
+        let requestHandler = BrowserNativeRequestHandler(
+            settingsProvider: { [weak self] origin in
+                guard let self,
+                      self.browserAuthorizedOrigins.contains(origin) else {
+                    return BrowserNativeBridgeSettings(
+                        autoMode: false,
+                        hoverMode: false,
+                        hideOriginal: false
+                    )
+                }
+                let autoMode = self.model.translatorEnabled
+                    && self.model.automaticSelectionTranslationEnabled
+                    && self.model.automaticSelectionTranslationPrivacyAcknowledged
+                return BrowserNativeBridgeSettings(
+                    autoMode: autoMode,
+                    hoverMode: self.model.translatorEnabled && self.model.hoverTranslationEnabled,
+                    hideOriginal: self.model.selectionDisplayMode == .translationOnly
+                )
+            },
+            targetResolver: { [weak self] text in
+                guard let self, self.model.automaticLanguageRoutingEnabled else {
+                    return self?.model.targetLanguage ?? .simplifiedChinese
+                }
+                return SelectionLanguageRouter.route(for: text).targetLanguage
+            },
+            translator: { text, target, workKind in
+                try await automaticTranslator.translate(
+                    text,
+                    to: target,
+                    workKind: workKind
+                ).text
+            }
+        )
+        let server = BrowserNativeBridgeServer { frame in
+            await requestHandler.responseFrame(for: frame)
+        }
+        do {
+            try server.start()
+            browserNativeBridgeServer = server
+        } catch {
+            // Fail closed. The helper will return a content-free
+            // `appUnavailable` error if no authenticated same-UID socket exists.
+            browserNativeBridgeServer = nil
+        }
+    }
+
+    @objc private func toggleBrowserOriginAuthorization(_ sender: NSMenuItem) {
+        guard let origin = sender.representedObject as? String,
+              BrowserNativeMessagingProtocol.allowedOrigins.contains(origin) else {
+            return
+        }
+        if browserAuthorizedOrigins.contains(origin) {
+            browserAuthorizedOrigins.remove(origin)
+        } else {
+            browserAuthorizedOrigins.insert(origin)
+        }
+        BrowserNativeDomainAuthorizationStore.save(browserAuthorizedOrigins)
+        if browserAuthorizedOrigins.isEmpty {
+            browserNativeBridgeServer?.stop()
+            browserNativeBridgeServer = nil
+        } else if browserNativeBridgeServer == nil {
+            configureBrowserNativeBridge()
+        }
+        configureStatusItem()
     }
 
     @objc private func showUsageGuide() {
@@ -239,6 +317,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func chooseSubtitleBilingual() {
         model.subtitleDisplayMode = .bilingual
+        configureStatusItem()
+    }
+
+    @objc private func chooseSubtitleRegionOCR() {
+        if model.subtitleTranslationActive { model.stopSubtitleTranslation() }
+        model.subtitleRecognitionMode = .regionOCR
+        model.statusMessage = "字幕来源已设为显式框选区域 OCR。"
+        configureStatusItem()
+    }
+
+    @objc private func chooseSubtitleSystemSpeech() {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "使用目标 App 的设备端语音字幕？"
+        alert.informativeText = "只有你点击开始后，才会通过屏幕录制权限捕获当时前台目标 App 的音频。音频不落盘，Apple 语音识别强制设备端，不会静默回退到网络；停止、暂停或把 App 加入隐私名单会结束会话。"
+        alert.addButton(withTitle: "使用设备端语音")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        if model.subtitleTranslationActive { model.stopSubtitleTranslation() }
+        model.subtitleRecognitionMode = .systemSpeech
+        model.statusMessage = "字幕来源已设为目标 App 的 Apple 设备端语音；启动时会请求明确授权。"
+        configureStatusItem()
+    }
+
+    @objc private func chooseSubtitleSpeechSystemLocale() {
+        chooseSubtitleSpeechLocale(.system)
+    }
+
+    @objc private func chooseSubtitleSpeechEnglish() {
+        chooseSubtitleSpeechLocale(.englishUS)
+    }
+
+    @objc private func chooseSubtitleSpeechChinese() {
+        chooseSubtitleSpeechLocale(.simplifiedChinese)
+    }
+
+    @objc private func chooseSubtitleSpeechJapanese() {
+        chooseSubtitleSpeechLocale(.japanese)
+    }
+
+    private func chooseSubtitleSpeechLocale(_ locale: SubtitleSpeechLocale) {
+        if model.subtitleTranslationActive { model.stopSubtitleTranslation() }
+        model.subtitleSpeechLocale = locale
+        model.statusMessage = "语音字幕源语言已设为 \(locale.displayName)。"
         configureStatusItem()
     }
 
@@ -667,13 +789,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(translateScreenRegionItem)
 
         let subtitleMenu = NSMenu(title: "视频字幕翻译")
+        let subtitleStartTitle: String
+        if model.subtitleTranslationActive {
+            subtitleStartTitle = "停止实时字幕"
+        } else if model.subtitleRecognitionMode == .systemSpeech {
+            subtitleStartTitle = "捕获当前 App 音频并开始…"
+        } else {
+            subtitleStartTitle = "框选字幕区域并开始…"
+        }
         let toggleSubtitleItem = NSMenuItem(
-            title: model.subtitleTranslationActive ? "停止实时字幕" : "框选字幕区域并开始…",
+            title: subtitleStartTitle,
             action: #selector(toggleSubtitleTranslation),
             keyEquivalent: ""
         )
         toggleSubtitleItem.isEnabled = model.translatorEnabled
         subtitleMenu.addItem(toggleSubtitleItem)
+        subtitleMenu.addItem(NSMenuItem.separator())
+
+        let recognitionSourceMenu = NSMenu(title: "字幕来源")
+        let regionOCRItem = NSMenuItem(
+            title: "显式框选区域 OCR",
+            action: #selector(chooseSubtitleRegionOCR),
+            keyEquivalent: ""
+        )
+        regionOCRItem.state = model.subtitleRecognitionMode == .regionOCR ? .on : .off
+        recognitionSourceMenu.addItem(regionOCRItem)
+        let systemSpeechItem = NSMenuItem(
+            title: "Apple 设备端语音（目标 App 音频）",
+            action: #selector(chooseSubtitleSystemSpeech),
+            keyEquivalent: ""
+        )
+        systemSpeechItem.state = model.subtitleRecognitionMode == .systemSpeech ? .on : .off
+        recognitionSourceMenu.addItem(systemSpeechItem)
+        let privateASRItem = disabledMenuItem("私有 ASR 模型（尚未安装）")
+        privateASRItem.state = model.subtitleRecognitionMode == .offlineASRModel ? .on : .off
+        recognitionSourceMenu.addItem(privateASRItem)
+        let recognitionSourceItem = NSMenuItem(
+            title: "来源: \(model.subtitleRecognitionMode == .systemSpeech ? "设备端语音" : "区域 OCR")",
+            action: nil,
+            keyEquivalent: ""
+        )
+        recognitionSourceItem.submenu = recognitionSourceMenu
+        subtitleMenu.addItem(recognitionSourceItem)
+
+        let speechLocaleMenu = NSMenu(title: "语音源语言")
+        let localeItems: [(String, SubtitleSpeechLocale, Selector)] = [
+            ("跟随系统语言", .system, #selector(chooseSubtitleSpeechSystemLocale)),
+            ("英语", .englishUS, #selector(chooseSubtitleSpeechEnglish)),
+            ("简体中文", .simplifiedChinese, #selector(chooseSubtitleSpeechChinese)),
+            ("日语", .japanese, #selector(chooseSubtitleSpeechJapanese))
+        ]
+        for (title, locale, action) in localeItems {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.state = model.subtitleSpeechLocale == locale ? .on : .off
+            speechLocaleMenu.addItem(item)
+        }
+        let speechLocaleItem = NSMenuItem(
+            title: "语音源语言: \(model.subtitleSpeechLocale.displayName)",
+            action: nil,
+            keyEquivalent: ""
+        )
+        speechLocaleItem.submenu = speechLocaleMenu
+        speechLocaleItem.isEnabled = model.subtitleRecognitionMode == .systemSpeech
+        subtitleMenu.addItem(speechLocaleItem)
         subtitleMenu.addItem(NSMenuItem.separator())
 
         let bilingualItem = NSMenuItem(title: "双语显示", action: #selector(chooseSubtitleBilingual), keyEquivalent: "")
@@ -741,6 +919,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hoverTranslationItem.state = model.hoverTranslationEnabled ? .on : .off
         hoverTranslationItem.isEnabled = model.translatorEnabled
         menu.addItem(hoverTranslationItem)
+
+        let browserAuthorizationMenu = NSMenu(title: "浏览器网页授权")
+        browserAuthorizationMenu.addItem(
+            disabledMenuItem("默认全部关闭；逐域允许后仍受上方本地开关约束")
+        )
+        browserAuthorizationMenu.addItem(.separator())
+        for origin in BrowserNativeMessagingProtocol.allowedOrigins.sorted() {
+            let item = NSMenuItem(
+                title: origin,
+                action: #selector(toggleBrowserOriginAuthorization(_:)),
+                keyEquivalent: ""
+            )
+            item.representedObject = origin
+            item.state = browserAuthorizedOrigins.contains(origin) ? .on : .off
+            browserAuthorizationMenu.addItem(item)
+        }
+        let browserAuthorizationItem = NSMenuItem(
+            title: "浏览器网页授权（\(browserAuthorizedOrigins.count)）",
+            action: nil,
+            keyEquivalent: ""
+        )
+        browserAuthorizationItem.submenu = browserAuthorizationMenu
+        menu.addItem(browserAuthorizationItem)
 
         let selectionDisplayMenu = NSMenu(title: "选区浮层显示")
         let selectionBilingualItem = NSMenuItem(
@@ -965,6 +1166,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         diagnosticsMenu.addItem(disabledMenuItem("选区被动识别: \(model.selectionDetectionEnabled ? "已开启" : "已关闭")"))
         diagnosticsMenu.addItem(disabledMenuItem("选中即翻译: \(model.automaticSelectionTranslationEnabled ? "已开启" : "已关闭")"))
         diagnosticsMenu.addItem(disabledMenuItem("鼠标悬停翻译: \(model.hoverTranslationEnabled ? "已开启" : "已关闭")"))
+        diagnosticsMenu.addItem(disabledMenuItem("浏览器已授权域: \(browserAuthorizedOrigins.count)"))
         diagnosticsMenu.addItem(disabledMenuItem("实时字幕: \(model.subtitleTranslationActive ? "运行中" : "未运行")"))
         diagnosticsMenu.addItem(disabledMenuItem("剪贴板兼容: \(model.clipboardCompatibilityEnabled ? "已开启（有本地暴露风险）" : "已关闭")"))
         diagnosticsMenu.addItem(disabledMenuItem("当前目标: \(model.targetAppName.isEmpty ? "未检测" : model.targetAppName)"))

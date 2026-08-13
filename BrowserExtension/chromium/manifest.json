@@ -3,8 +3,8 @@
   "name": "Invisible Translator Companion",
   "version": "1.0.0",
   "description": "A local companion for explicitly authorised bilingual translation.",
-  "minimum_chrome_version": "102",
-  "permissions": ["nativeMessaging"],
+  "minimum_chrome_version": "106",
+  "permissions": ["nativeMessaging", "webNavigation"],
   "host_permissions": [
     "https://chatgpt.com/*",
     "https://chat.openai.com/*",

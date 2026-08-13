@@ -8,6 +8,20 @@ struct StoragePerformanceLocations: Equatable {
     let appBundleURL: URL
     let cacheDirectoryURL: URL
     let asrModelsDirectoryURL: URL
+    let applicationSupportRootURL: URL
+
+    init(
+        appBundleURL: URL,
+        cacheDirectoryURL: URL,
+        asrModelsDirectoryURL: URL,
+        applicationSupportRootURL: URL? = nil
+    ) {
+        self.appBundleURL = appBundleURL
+        self.cacheDirectoryURL = cacheDirectoryURL
+        self.asrModelsDirectoryURL = asrModelsDirectoryURL
+        self.applicationSupportRootURL = applicationSupportRootURL
+            ?? asrModelsDirectoryURL.deletingLastPathComponent().deletingLastPathComponent()
+    }
 
     static func live(fileManager: FileManager = .default) -> StoragePerformanceLocations {
         let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
@@ -17,7 +31,8 @@ struct StoragePerformanceLocations: Equatable {
         return StoragePerformanceLocations(
             appBundleURL: Bundle.main.bundleURL,
             cacheDirectoryURL: caches,
-            asrModelsDirectoryURL: support.appendingPathComponent("ASRModels", isDirectory: true)
+            asrModelsDirectoryURL: support.appendingPathComponent("ASRModels", isDirectory: true),
+            applicationSupportRootURL: support.deletingLastPathComponent()
         )
     }
 }
@@ -48,6 +63,7 @@ struct StoragePerformanceSnapshot: Equatable {
 enum StoragePerformanceError: LocalizedError, Equatable {
     case unsafeModelDirectory
     case modelDirectoryIsSymbolicLink
+    case modelParentIsSymbolicLink
 
     var errorDescription: String? {
         switch self {
@@ -55,6 +71,8 @@ enum StoragePerformanceError: LocalizedError, Equatable {
             return "模型目录不属于无感翻译，已拒绝操作。"
         case .modelDirectoryIsSymbolicLink:
             return "模型目录是符号链接，已拒绝操作。"
+        case .modelParentIsSymbolicLink:
+            return "模型上级目录包含符号链接，已拒绝操作。"
         }
     }
 }
@@ -78,7 +96,7 @@ struct StoragePerformanceInspector {
         StoragePerformanceSnapshot(
             appByteCount: allocatedBytes(at: locations.appBundleURL),
             cacheByteCount: allocatedBytes(at: locations.cacheDirectoryURL),
-            asrModelByteCount: allocatedBytes(at: locations.asrModelsDirectoryURL)
+            asrModelByteCount: allocatedASRModelBytes()
         )
     }
 
@@ -90,15 +108,7 @@ struct StoragePerformanceInspector {
         guard isExpectedOwnedModelDirectory(url) else {
             throw StoragePerformanceError.unsafeModelDirectory
         }
-        guard fileManager.fileExists(atPath: url.path) else { return nil }
-
-        let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-        guard values.isSymbolicLink != true else {
-            throw StoragePerformanceError.modelDirectoryIsSymbolicLink
-        }
-        guard values.isDirectory == true else {
-            throw StoragePerformanceError.unsafeModelDirectory
-        }
+        guard try validatedASRModelDirectoryExists() else { return nil }
 
         var trashedURL: NSURL?
         try fileManager.trashItem(at: url, resultingItemURL: &trashedURL)
@@ -110,6 +120,42 @@ struct StoragePerformanceInspector {
         let parent = url.deletingLastPathComponent()
         guard parent.lastPathComponent == "ClaudePromptTranslator" else { return false }
         return url == locations.asrModelsDirectoryURL.standardizedFileURL
+    }
+
+    /// Uses the same fixed-boundary lstat chain for both size inspection and
+    /// deletion. A redirected parent therefore produces zero model bytes and
+    /// is never handed to FileManager's recursive enumerator.
+    private func validatedASRModelDirectoryExists() throws -> Bool {
+        let modelDirectory = locations.asrModelsDirectoryURL.standardizedFileURL
+        guard isExpectedOwnedModelDirectory(modelDirectory) else {
+            throw StoragePerformanceError.unsafeModelDirectory
+        }
+
+        do {
+            return try SecureOwnedDirectoryChain.validateExistingDirectory(
+                from: locations.applicationSupportRootURL.standardizedFileURL,
+                through: modelDirectory
+            )
+        } catch let error as SecureOwnedDirectoryChain.ValidationError {
+            if case .symbolicLink(let url) = error {
+                if url.standardizedFileURL == modelDirectory {
+                    throw StoragePerformanceError.modelDirectoryIsSymbolicLink
+                }
+                throw StoragePerformanceError.modelParentIsSymbolicLink
+            }
+            throw StoragePerformanceError.unsafeModelDirectory
+        } catch {
+            throw StoragePerformanceError.unsafeModelDirectory
+        }
+    }
+
+    private func allocatedASRModelBytes() -> Int64 {
+        do {
+            guard try validatedASRModelDirectoryExists() else { return 0 }
+            return allocatedBytes(at: locations.asrModelsDirectoryURL)
+        } catch {
+            return 0
+        }
     }
 
     private func allocatedBytes(at rootURL: URL) -> Int64 {
