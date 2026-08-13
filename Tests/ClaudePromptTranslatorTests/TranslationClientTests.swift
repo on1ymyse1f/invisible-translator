@@ -4,6 +4,16 @@ import XCTest
 @testable import ClaudePromptTranslator
 
 final class TranslationClientTests: XCTestCase {
+    func testAppThemeExposesClaudeAndCyberpunkChoicesWithLegacyMigration() {
+        XCTAssertTrue(AppTheme.allCases.contains(.claude))
+        XCTAssertTrue(AppTheme.allCases.contains(.dark))
+        XCTAssertTrue(AppTheme.allCases.contains(.cyberpunk))
+        XCTAssertEqual(AppTheme(rawValue: "tokyoBlue"), .cyberpunk)
+        XCTAssertEqual(AppTheme.claude.preferredColorScheme, .light)
+        XCTAssertEqual(AppTheme.cyberpunk.preferredColorScheme, .dark)
+        XCTAssertEqual(AppTheme.cyberpunk.displayName, "赛博霓虹")
+    }
+
     func testAutomaticBrowserAIContextRequiresKnownHost() throws {
         XCTAssertTrue(
             ClaudeContextDetector.isKnownAIWebURL(

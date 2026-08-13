@@ -82,7 +82,7 @@ final class PromptPanelController {
             defer: false
         )
 
-        panel.title = "无感翻译 · 草稿翻译窗"
+        panel.title = "无感翻译 · 本机翻译工作台"
         panel.level = .floating
         panel.isReleasedWhenClosed = false
         panel.titleVisibility = .hidden

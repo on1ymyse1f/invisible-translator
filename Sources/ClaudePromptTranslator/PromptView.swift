@@ -15,6 +15,8 @@ struct PromptView: View {
                 .fill(palette.panelBackground)
                 .ignoresSafeArea()
 
+            themeAtmosphere
+
             if model.panelPresentation == .compact {
                 compactContent
                     .padding(.horizontal, 18)
@@ -32,7 +34,55 @@ struct PromptView: View {
             }
         }
         .preferredColorScheme(model.appTheme.preferredColorScheme)
+        .animation(.easeInOut(duration: 0.22), value: model.appTheme)
         .frame(width: panelSize.width, height: panelSize.height)
+    }
+
+    @ViewBuilder
+    private var themeAtmosphere: some View {
+        if model.appTheme == .cyberpunk {
+            GeometryReader { proxy in
+                ZStack {
+                    RadialGradient(
+                        colors: [palette.accent.opacity(0.18), .clear],
+                        center: .topLeading,
+                        startRadius: 6,
+                        endRadius: min(proxy.size.width, proxy.size.height) * 0.72
+                    )
+                    RadialGradient(
+                        colors: [palette.secondaryAccent.opacity(0.13), .clear],
+                        center: .bottomTrailing,
+                        startRadius: 8,
+                        endRadius: min(proxy.size.width, proxy.size.height) * 0.68
+                    )
+                    Canvas { context, size in
+                        var grid = Path()
+                        for x in stride(from: 0.0, through: size.width, by: 32.0) {
+                            grid.move(to: CGPoint(x: x, y: 0))
+                            grid.addLine(to: CGPoint(x: x, y: size.height))
+                        }
+                        for y in stride(from: 0.0, through: size.height, by: 32.0) {
+                            grid.move(to: CGPoint(x: 0, y: y))
+                            grid.addLine(to: CGPoint(x: size.width, y: y))
+                        }
+                        context.stroke(grid, with: .color(palette.accent.opacity(0.065)), lineWidth: 0.5)
+                    }
+                }
+            }
+            .ignoresSafeArea()
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+        } else if model.appTheme.isClaudeFamily {
+            RadialGradient(
+                colors: [palette.accent.opacity(0.075), .clear],
+                center: .topTrailing,
+                startRadius: 10,
+                endRadius: 440
+            )
+            .ignoresSafeArea()
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+        }
     }
 
     private var panelSize: CGSize {
@@ -48,7 +98,7 @@ struct PromptView: View {
         HStack(alignment: .center, spacing: 14) {
             ZStack {
                 RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .fill(palette.accent.opacity(model.appTheme == .tokyoBlue ? 0.16 : 0.10))
+                    .fill(palette.accent.opacity(model.appTheme.isCyberpunk ? 0.16 : 0.10))
                     .overlay(
                         RoundedRectangle(cornerRadius: 16, style: .continuous)
                             .stroke(palette.accent.opacity(0.34), lineWidth: 1)
@@ -63,8 +113,12 @@ struct PromptView: View {
             .shadow(color: palette.accent.opacity(0.22), radius: 8, x: 0, y: 3)
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("草稿翻译")
-                    .font(.system(size: 18, weight: .semibold))
+                Text(model.appTheme.isCyberpunk ? "LOCAL TRANSLATION // 01" : "本机翻译工作台")
+                    .font(.system(size: 10, weight: .bold, design: model.appTheme.isCyberpunk ? .monospaced : .default))
+                    .tracking(model.appTheme.isCyberpunk ? 1.2 : 0.2)
+                    .foregroundStyle(model.appTheme.isCyberpunk ? palette.accent : palette.secondaryText)
+                Text("把想法自然地换一种语言")
+                    .font(.system(size: 18, weight: .semibold, design: .rounded))
                     .foregroundStyle(palette.primaryText)
                 HStack(spacing: 6) {
                     safetyBadge("本机翻译", systemImage: "lock.fill")
@@ -101,7 +155,7 @@ struct PromptView: View {
                     .foregroundStyle(palette.secondaryText)
                 Picker("外观", selection: $model.appTheme) {
                     ForEach(AppTheme.allCases) { theme in
-                        Text(theme.displayName).tag(theme)
+                        Label(theme.displayName, systemImage: theme.symbolName).tag(theme)
                     }
                 }
                 .labelsHidden()
@@ -115,7 +169,7 @@ struct PromptView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("草稿输入")
+                    Text("写下你想表达的内容")
                         .font(.headline.weight(.semibold))
                         .foregroundStyle(palette.primaryText)
                     Text(targetDescription)
@@ -153,7 +207,7 @@ struct PromptView: View {
                 .padding(8)
 
                 if model.promptText.isEmpty {
-                    Text("输入要发送给 AI 的草稿，按 Enter 翻译并写入已聚焦的消息输入框")
+                    Text("输入草稿，按 Enter 翻译并写入当前聚焦的消息输入框")
                         .foregroundStyle(palette.subtleText)
                         .padding(.horizontal, 24)
                         .padding(.vertical, 22)
@@ -171,7 +225,7 @@ struct PromptView: View {
             }
 
             HStack(spacing: 10) {
-                Button(model.isTranslating ? "正在翻译…" : "翻译并写入草稿") {
+                Button(model.isTranslating ? "正在翻译…" : "翻译并写入") {
                     model.submitPrompt()
                 }
                 .keyboardShortcut(.return, modifiers: [])
@@ -219,7 +273,7 @@ struct PromptView: View {
             HStack(alignment: .center, spacing: 12) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .fill(palette.accent.opacity(model.appTheme == .tokyoBlue ? 0.18 : 0.10))
+                        .fill(palette.accent.opacity(model.appTheme.isCyberpunk ? 0.18 : 0.10))
                         .overlay(
                             RoundedRectangle(cornerRadius: 14, style: .continuous)
                                 .stroke(palette.accent.opacity(0.32), lineWidth: 1)
@@ -234,7 +288,7 @@ struct PromptView: View {
 
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 8) {
-                        Text("草稿翻译")
+                        Text(model.appTheme.isCyberpunk ? "TRANSLATE // LOCAL" : "本机翻译")
                             .font(.system(size: 14, weight: .semibold))
                             .foregroundStyle(palette.primaryText)
 
@@ -349,7 +403,7 @@ struct PromptView: View {
         .padding(.vertical, 8)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(palette.accent.opacity(model.appTheme == .tokyoBlue ? 0.13 : 0.08))
+                .fill(palette.accent.opacity(model.appTheme.isCyberpunk ? 0.13 : 0.08))
         )
         .accessibilityIdentifier("cpt.prompt.status")
     }
@@ -370,7 +424,7 @@ struct PromptView: View {
             HStack(spacing: 10) {
                 ZStack {
                     Circle()
-                        .fill(palette.accent.opacity(model.appTheme == .tokyoBlue ? 0.20 : 0.12))
+                        .fill(palette.accent.opacity(model.appTheme.isCyberpunk ? 0.20 : 0.12))
                         .overlay(Circle().stroke(palette.accent.opacity(0.34), lineWidth: 1))
                     Text("译")
                         .font(.system(size: compact ? 12 : 14, weight: .bold))
@@ -416,7 +470,7 @@ struct PromptView: View {
             .frame(maxWidth: .infinity, minHeight: bodyMinHeight, maxHeight: maxBodyHeight)
             .background(
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(palette.cardBackground.opacity(model.appTheme == .tokyoBlue ? 0.72 : 0.82))
+                    .fill(palette.cardBackground.opacity(model.appTheme.isCyberpunk ? 0.72 : 0.82))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
@@ -436,14 +490,14 @@ struct PromptView: View {
                 .fill(.ultraThinMaterial)
                 .overlay(
                     RoundedRectangle(cornerRadius: compact ? 18 : 20, style: .continuous)
-                        .fill(palette.cardBackground.opacity(model.appTheme == .tokyoBlue ? 0.48 : 0.34))
+                        .fill(palette.cardBackground.opacity(model.appTheme.isCyberpunk ? 0.48 : 0.34))
                 )
         )
         .overlay(
             RoundedRectangle(cornerRadius: compact ? 18 : 20, style: .continuous)
                 .stroke(palette.cardBorder.opacity(1.35), lineWidth: 1)
         )
-        .shadow(color: palette.accent.opacity(model.appTheme == .tokyoBlue ? 0.18 : 0.08), radius: 16, x: 0, y: 8)
+        .shadow(color: palette.accent.opacity(model.appTheme.isCyberpunk ? 0.18 : 0.08), radius: 16, x: 0, y: 8)
     }
 
     private var responseTranslationBodyText: String {

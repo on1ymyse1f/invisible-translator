@@ -272,7 +272,7 @@ final class AppModel: ObservableObject {
         self.targetLanguage = savedTarget
 
         let savedTheme = UserDefaults.standard.string(forKey: DefaultsKey.appTheme)
-            .flatMap(AppTheme.init(rawValue:)) ?? .system
+            .flatMap(AppTheme.init(rawValue:)) ?? .claude
         self.appTheme = savedTheme
 
         if UserDefaults.standard.object(forKey: DefaultsKey.translatorEnabled) == nil {
@@ -404,6 +404,33 @@ final class AppModel: ObservableObject {
     func showPanel(reason: ShowReason) {
         showPanel(target: nil, reason: reason)
     }
+
+#if DEBUG
+    /// Deterministic, content-safe visual state for theme review. This helper is
+    /// compiled out of Release and never reads another application.
+    func showSelectionOverlayThemePreview() {
+        selectionDisplayMode = .bilingual
+        selectionPhase = .translated
+        selectionSourceText = "A calm interface keeps the translation itself in focus."
+        selectionTranslationText = "克制的界面，让翻译内容始终成为焦点。"
+        selectionStatus = "Apple 本机翻译 · 示例内容"
+        selectionSourceLanguageName = "English"
+        selectionTargetLanguageName = "简体中文"
+        selectionSourceAppName = "安全预览"
+        selectionCanReplace = false
+
+        let visibleFrame = NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1_440, height: 900)
+        let anchor = NSRect(
+            x: visibleFrame.midX - 120,
+            y: visibleFrame.midY + 120,
+            width: 240,
+            height: 28
+        )
+        selectionOverlayController.show(anchorRect: anchor)
+        NSApp.activate()
+    }
+#endif
 
     func setTranslatorEnabled(_ enabled: Bool) {
         guard translatorEnabled != enabled else {

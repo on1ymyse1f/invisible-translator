@@ -38,6 +38,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             SelfTestRunner.run(selfTest)
             return
         }
+
+        let showsWorkbenchPreview = CommandLine.arguments.contains("--ui-preview-workbench")
+        let showsSelectionPreview = CommandLine.arguments.contains("--ui-preview-selection-overlay")
+        if showsWorkbenchPreview || showsSelectionPreview {
+            UserDefaults.standard.set(
+                true,
+                forKey: UsageGuideController.presentationDefaultsKey
+            )
+        }
 #endif
 
         existingInstanceAtLaunch = findExistingInstance()
@@ -77,6 +86,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.model.revealEdgeBar()
             }
         }
+
+#if DEBUG
+        if showsWorkbenchPreview {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.model.showPanel(reason: .manual)
+            }
+        } else if showsSelectionPreview {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.model.showSelectionOverlayThemePreview()
+            }
+        }
+#endif
 
         if existingInstanceAtLaunch != nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
@@ -441,12 +462,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         chooseTheme(.system)
     }
 
+    @objc private func chooseClaudeTheme() {
+        chooseTheme(.claude)
+    }
+
     @objc private func chooseDarkTheme() {
         chooseTheme(.dark)
     }
 
-    @objc private func chooseTokyoBlueTheme() {
-        chooseTheme(.tokyoBlue)
+    @objc private func chooseCyberpunkTheme() {
+        chooseTheme(.cyberpunk)
     }
 
     @objc private func requestAccessibilityPermission() {
@@ -773,13 +798,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         systemThemeItem.state = model.appTheme == .system ? .on : .off
         themeMenu.addItem(systemThemeItem)
 
+        let claudeThemeItem = NSMenuItem(title: AppTheme.claude.menuTitle, action: #selector(chooseClaudeTheme), keyEquivalent: "")
+        claudeThemeItem.state = model.appTheme == .claude ? .on : .off
+        themeMenu.addItem(claudeThemeItem)
+
         let darkThemeItem = NSMenuItem(title: AppTheme.dark.menuTitle, action: #selector(chooseDarkTheme), keyEquivalent: "")
         darkThemeItem.state = model.appTheme == .dark ? .on : .off
         themeMenu.addItem(darkThemeItem)
 
-        let tokyoBlueThemeItem = NSMenuItem(title: AppTheme.tokyoBlue.menuTitle, action: #selector(chooseTokyoBlueTheme), keyEquivalent: "")
-        tokyoBlueThemeItem.state = model.appTheme == .tokyoBlue ? .on : .off
-        themeMenu.addItem(tokyoBlueThemeItem)
+        let cyberpunkThemeItem = NSMenuItem(title: AppTheme.cyberpunk.menuTitle, action: #selector(chooseCyberpunkTheme), keyEquivalent: "")
+        cyberpunkThemeItem.state = model.appTheme == .cyberpunk ? .on : .off
+        themeMenu.addItem(cyberpunkThemeItem)
         let themeItem = NSMenuItem(title: "外观：\(model.appTheme.displayName)", action: nil, keyEquivalent: "")
         themeItem.submenu = themeMenu
         menu.addItem(themeItem)

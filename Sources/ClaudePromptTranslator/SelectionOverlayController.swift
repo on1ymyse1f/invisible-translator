@@ -164,6 +164,11 @@ final class SelectionOverlayController {
 
 private struct SelectionOverlayView: View {
     @ObservedObject var model: AppModel
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var palette: PromptPalette {
+        PromptPalette(theme: model.appTheme, colorScheme: colorScheme)
+    }
 
     var body: some View {
         Group {
@@ -173,27 +178,78 @@ private struct SelectionOverlayView: View {
                 translationCard
             }
         }
-        .background(.ultraThinMaterial)
+        .background(selectionBackground)
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(Color.primary.opacity(0.14), lineWidth: 1)
+                .stroke(palette.cardBorder, lineWidth: model.appTheme.isCyberpunk ? 1.2 : 1)
         )
-        .shadow(color: .black.opacity(0.18), radius: 18, x: 0, y: 8)
+        .shadow(
+            color: model.appTheme.isCyberpunk
+                ? palette.accent.opacity(0.24)
+                : .black.opacity(0.18),
+            radius: model.appTheme.isCyberpunk ? 22 : 18,
+            x: 0,
+            y: 8
+        )
+        .preferredColorScheme(model.appTheme.preferredColorScheme)
+    }
+
+    @ViewBuilder
+    private var selectionBackground: some View {
+        ZStack {
+            Rectangle()
+                .fill(.ultraThinMaterial)
+
+            if model.appTheme.isCyberpunk {
+                Rectangle()
+                    .fill(palette.panelBackground)
+
+                RadialGradient(
+                    colors: [palette.secondaryAccent.opacity(0.14), .clear],
+                    center: .bottomTrailing,
+                    startRadius: 6,
+                    endRadius: 260
+                )
+
+                Canvas { context, size in
+                    var grid = Path()
+                    for x in stride(from: 0.0, through: size.width, by: 28.0) {
+                        grid.move(to: CGPoint(x: x, y: 0))
+                        grid.addLine(to: CGPoint(x: x, y: size.height))
+                    }
+                    for y in stride(from: 0.0, through: size.height, by: 28.0) {
+                        grid.move(to: CGPoint(x: 0, y: y))
+                        grid.addLine(to: CGPoint(x: size.width, y: y))
+                    }
+                    context.stroke(
+                        grid,
+                        with: .color(palette.accent.opacity(0.075)),
+                        lineWidth: 0.5
+                    )
+                }
+            } else {
+                Rectangle()
+                    .fill(palette.cardBackground.opacity(0.94))
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 
     private var detectedPill: some View {
         HStack(spacing: 10) {
             Image(systemName: "translate")
                 .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(.tint)
+                .foregroundStyle(palette.accent)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text("已识别选区 · \(model.selectionSourceLanguageName) → \(model.selectionTargetLanguageName)")
                     .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(palette.primaryText)
                 Text("\(model.selectionSourceText.count) 个字符 · \(model.selectionSourceAppName) · 只处理这段文字")
                     .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(palette.secondaryText)
                     .lineLimit(1)
             }
 
@@ -203,6 +259,7 @@ private struct SelectionOverlayView: View {
                 model.translateDetectedSelection()
             }
             .buttonStyle(.borderedProminent)
+            .tint(palette.accent)
             .controlSize(.small)
             .accessibilityIdentifier("cpt.selection.translate")
 
@@ -212,7 +269,7 @@ private struct SelectionOverlayView: View {
                 Image(systemName: "xmark")
             }
             .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(palette.secondaryText)
             .help("关闭")
             .frame(width: 28, height: 28)
             .contentShape(Rectangle())
@@ -227,12 +284,13 @@ private struct SelectionOverlayView: View {
         VStack(alignment: .leading, spacing: 11) {
             HStack(spacing: 8) {
                 Image(systemName: "translate")
-                    .foregroundStyle(.tint)
+                    .foregroundStyle(palette.accent)
                 Text("选区翻译 · \(model.selectionSourceLanguageName) → \(model.selectionTargetLanguageName)")
                     .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(palette.primaryText)
                 Text("· \(model.selectionSourceAppName)")
                     .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(palette.secondaryText)
                     .lineLimit(1)
                 Spacer()
                 Button {
@@ -241,7 +299,7 @@ private struct SelectionOverlayView: View {
                     Image(systemName: "xmark.circle.fill")
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(palette.secondaryText)
                 .frame(width: 28, height: 28)
                 .contentShape(Rectangle())
                 .accessibilityLabel("关闭翻译浮层")
@@ -252,9 +310,10 @@ private struct SelectionOverlayView: View {
                 VStack(alignment: .leading, spacing: 5) {
                     Text("原文")
                         .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(palette.secondaryText)
                     ScrollView {
                         RichTranslationText(text: model.selectionSourceText, fontSize: 12)
+                            .foregroundStyle(palette.primaryText.opacity(0.88))
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
@@ -267,14 +326,14 @@ private struct SelectionOverlayView: View {
             VStack(alignment: .leading, spacing: 5) {
                 Text("译文")
                     .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(palette.secondaryText)
                 if model.selectionPhase == .reading || model.selectionPhase == .translating {
                     HStack(spacing: 8) {
                         ProgressView()
                             .controlSize(.small)
                         Text(model.selectionStatus)
                             .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(palette.secondaryText)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                 } else {
@@ -285,7 +344,7 @@ private struct SelectionOverlayView: View {
                                 : model.selectionTranslationText,
                             fontSize: 13
                         )
-                            .foregroundStyle(model.selectionPhase == .failed ? .red : .primary)
+                            .foregroundStyle(model.selectionPhase == .failed ? .red : palette.primaryText)
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
@@ -296,7 +355,7 @@ private struct SelectionOverlayView: View {
             HStack(spacing: 9) {
                 Text(selectionFooterText)
                     .font(.caption2)
-                    .foregroundStyle(model.selectionPhase == .failed ? .red : .secondary)
+                    .foregroundStyle(model.selectionPhase == .failed ? .red : palette.secondaryText)
                     .lineLimit(1)
                     .help(selectionFooterText)
                     .accessibilityIdentifier("cpt.selection.status")
@@ -313,6 +372,8 @@ private struct SelectionOverlayView: View {
                 Button("复制译文") {
                     model.copySelectionTranslation()
                 }
+                .buttonStyle(.bordered)
+                .tint(palette.accent)
                 .disabled(model.selectionTranslationText.isEmpty)
                 .accessibilityIdentifier("cpt.selection.copy")
 
@@ -321,6 +382,7 @@ private struct SelectionOverlayView: View {
                         model.replaceSelectionWithTranslation()
                     }
                     .buttonStyle(.borderedProminent)
+                    .tint(palette.accent)
                     .disabled(model.selectionTranslationText.isEmpty)
                     .accessibilityIdentifier("cpt.selection.replace")
                 }
