@@ -13,22 +13,22 @@ enum AppTheme: String, CaseIterable, Identifiable {
     var displayName: String {
         switch self {
         case .system:
-            return "System"
+            return "跟随系统"
         case .dark:
-            return "Dark"
+            return "深色"
         case .tokyoBlue:
-            return "Tokyo Blue"
+            return "东京蓝"
         }
     }
 
     var menuTitle: String {
         switch self {
         case .system:
-            return "Theme: System"
+            return "外观：跟随系统"
         case .dark:
-            return "Theme: Dark"
+            return "外观：深色"
         case .tokyoBlue:
-            return "Theme: Tokyo Blue"
+            return "外观：东京蓝"
         }
     }
 

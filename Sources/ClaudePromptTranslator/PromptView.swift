@@ -63,12 +63,14 @@ struct PromptView: View {
             .shadow(color: palette.accent.opacity(0.22), radius: 8, x: 0, y: 3)
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("无感翻译 · 备用草稿")
+                Text("草稿翻译")
                     .font(.system(size: 18, weight: .semibold))
                     .foregroundStyle(palette.primaryText)
-                Text("翻译后只写入之前聚焦的 AI 草稿框，不会按 Enter，也不会发送。Shift+Enter 换行。")
-                    .font(.caption)
-                    .foregroundStyle(palette.secondaryText)
+                HStack(spacing: 6) {
+                    safetyBadge("本机翻译", systemImage: "lock.fill")
+                    safetyBadge("只写草稿", systemImage: "arrow.down.to.line")
+                    safetyBadge("不会发送", systemImage: "paperplane")
+                }
             }
 
             Spacer()
@@ -79,32 +81,48 @@ struct PromptView: View {
 
     private var controlStack: some View {
         VStack(alignment: .trailing, spacing: 8) {
-            Picker("Target", selection: $model.targetLanguage) {
-                ForEach(TargetLanguage.allCases) { language in
-                    Text(language.displayName).tag(language)
+            HStack(spacing: 7) {
+                Text("翻译到")
+                    .font(.caption)
+                    .foregroundStyle(palette.secondaryText)
+                Picker("目标语言", selection: $model.targetLanguage) {
+                    ForEach(TargetLanguage.allCases) { language in
+                        Text(language.displayName).tag(language)
+                    }
                 }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 132, alignment: .trailing)
             }
-            .labelsHidden()
-            .pickerStyle(.segmented)
-            .frame(width: 210)
 
-            Picker("Theme", selection: $model.appTheme) {
-                ForEach(AppTheme.allCases) { theme in
-                    Text(theme.displayName).tag(theme)
+            HStack(spacing: 7) {
+                Text("外观")
+                    .font(.caption)
+                    .foregroundStyle(palette.secondaryText)
+                Picker("外观", selection: $model.appTheme) {
+                    ForEach(AppTheme.allCases) { theme in
+                        Text(theme.displayName).tag(theme)
+                    }
                 }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 132, alignment: .trailing)
             }
-            .labelsHidden()
-            .pickerStyle(.segmented)
-            .frame(width: 250)
         }
     }
 
     private var editorCard: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("输入")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(palette.secondaryText)
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("草稿输入")
+                        .font(.headline.weight(.semibold))
+                        .foregroundStyle(palette.primaryText)
+                    Text(targetDescription)
+                        .font(.caption)
+                        .foregroundStyle(palette.secondaryText)
+                        .lineLimit(1)
+                }
 
                 Spacer()
 
@@ -135,7 +153,7 @@ struct PromptView: View {
                 .padding(8)
 
                 if model.promptText.isEmpty {
-                    Text("输入中文草稿，按 Enter 翻译为\(model.targetLanguage.shortChineseName)并写入目标输入框；不会发送")
+                    Text("输入要发送给 AI 的草稿，按 Enter 翻译并写入已聚焦的消息输入框")
                         .foregroundStyle(palette.subtleText)
                         .padding(.horizontal, 24)
                         .padding(.vertical, 22)
@@ -148,6 +166,10 @@ struct PromptView: View {
 
     private var footer: some View {
         VStack(alignment: .leading, spacing: 10) {
+            if !model.statusMessage.isEmpty {
+                statusBanner
+            }
+
             HStack(spacing: 10) {
                 Button(model.isTranslating ? "正在翻译…" : "翻译并写入草稿") {
                     model.submitPrompt()
@@ -169,12 +191,6 @@ struct PromptView: View {
 
                 Spacer()
 
-                Text(model.statusMessage)
-                    .font(.caption)
-                    .foregroundStyle(palette.secondaryText)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.trailing)
-                    .frame(maxWidth: 300, alignment: .trailing)
             }
 
             if !model.lastTranslation.isEmpty {
@@ -218,7 +234,7 @@ struct PromptView: View {
 
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 8) {
-                        Text("无感翻译 · 备用草稿")
+                        Text("草稿翻译")
                             .font(.system(size: 14, weight: .semibold))
                             .foregroundStyle(palette.primaryText)
 
@@ -226,13 +242,17 @@ struct PromptView: View {
                             .font(.caption)
                             .foregroundStyle(palette.secondaryText)
                             .lineLimit(1)
+
+                        Text("不会发送")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(palette.subtleText)
                     }
 
                     compactEditor
                 }
 
                 VStack(alignment: .trailing, spacing: 8) {
-                    Picker("Target", selection: $model.targetLanguage) {
+                    Picker("目标语言", selection: $model.targetLanguage) {
                         ForEach(TargetLanguage.allCases) { language in
                             Text(language.displayName).tag(language)
                         }
@@ -294,7 +314,7 @@ struct PromptView: View {
             .padding(5)
 
             if model.promptText.isEmpty {
-                Text("输入中文，Enter 翻译并写入草稿（不会发送）")
+                Text("输入草稿，Enter 翻译并写入（不会发送）")
                     .font(.system(size: 13))
                     .foregroundStyle(palette.subtleText)
                     .padding(.horizontal, 18)
@@ -307,7 +327,40 @@ struct PromptView: View {
 
     private var targetSummary: String {
         let appName = model.targetAppName.isEmpty ? "尚未绑定目标" : model.targetAppName
-        return "→ \(appName)"
+        return "目标：\(appName)"
+    }
+
+    private var targetDescription: String {
+        let appName = model.targetAppName.isEmpty ? "尚未确认目标 App" : model.targetAppName
+        return "写入：\(appName) · 只改草稿，不发送"
+    }
+
+    private var statusBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: model.isTranslating ? "arrow.triangle.2.circlepath" : "info.circle")
+                .foregroundStyle(palette.accent)
+            Text(model.statusMessage)
+                .font(.caption)
+                .foregroundStyle(palette.secondaryText)
+                .lineLimit(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(palette.accent.opacity(model.appTheme == .tokyoBlue ? 0.13 : 0.08))
+        )
+        .accessibilityIdentifier("cpt.prompt.status")
+    }
+
+    private func safetyBadge(_ title: String, systemImage: String) -> some View {
+        Label(title, systemImage: systemImage)
+            .font(.caption2.weight(.medium))
+            .foregroundStyle(palette.secondaryText)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(Capsule().fill(palette.cardBackground.opacity(0.72)))
     }
 
     private func replyTranslationCard(maxBodyHeight: CGFloat, compact: Bool) -> some View {
@@ -329,8 +382,8 @@ struct PromptView: View {
                     Text("回复翻译")
                         .font(.system(size: compact ? 13.5 : 15, weight: .semibold))
                         .foregroundStyle(palette.primaryText)
-                    Text(responseTranslationSubtitle)
-                        .font(.caption)
+                    Text("选区优先 · 仅 Accessibility 自动读取")
+                        .font(.caption2)
                         .foregroundStyle(palette.secondaryText)
                         .lineLimit(1)
                 }
@@ -342,7 +395,7 @@ struct PromptView: View {
                         .controlSize(.small)
                 }
 
-                Button("复制") {
+                Button("复制译文") {
                     model.copyResponseTranslation()
                 }
                 .controlSize(.small)
@@ -393,13 +446,6 @@ struct PromptView: View {
         .shadow(color: palette.accent.opacity(model.appTheme == .tokyoBlue ? 0.18 : 0.08), radius: 16, x: 0, y: 8)
     }
 
-    private var responseTranslationSubtitle: String {
-        if !model.responseSourceLanguageName.isEmpty {
-            return "检测到 \(model.responseSourceLanguageName) 输出，自动显示中文译文"
-        }
-        return "检测到英文或日文回复后会自动显示在这里"
-    }
-
     private var responseTranslationBodyText: String {
         if !model.responseTranslationText.isEmpty {
             return model.responseTranslationText
@@ -409,6 +455,6 @@ struct PromptView: View {
             return model.responseTranslationStatus
         }
 
-        return "等待 AI 输出英文或日文内容..."
+        return "选中 assistant 回复后点击“译回复”；也可读取最新可见回复"
     }
 }

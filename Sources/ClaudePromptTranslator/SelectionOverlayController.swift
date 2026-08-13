@@ -189,9 +189,9 @@ private struct SelectionOverlayView: View {
                 .foregroundStyle(.tint)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("\(model.selectionSourceLanguageName) → \(model.selectionTargetLanguageName)")
+                Text("已识别选区 · \(model.selectionSourceLanguageName) → \(model.selectionTargetLanguageName)")
                     .font(.system(size: 12, weight: .semibold))
-                Text("已选择 \(model.selectionSourceText.count) 个字符 · \(model.selectionSourceAppName)")
+                Text("\(model.selectionSourceText.count) 个字符 · \(model.selectionSourceAppName) · 只处理这段文字")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -199,7 +199,7 @@ private struct SelectionOverlayView: View {
 
             Spacer(minLength: 6)
 
-            Button("翻译") {
+            Button("翻译选区") {
                 model.translateDetectedSelection()
             }
             .buttonStyle(.borderedProminent)
@@ -228,7 +228,7 @@ private struct SelectionOverlayView: View {
             HStack(spacing: 8) {
                 Image(systemName: "translate")
                     .foregroundStyle(.tint)
-                Text("\(model.selectionSourceLanguageName) → \(model.selectionTargetLanguageName)")
+                Text("选区翻译 · \(model.selectionSourceLanguageName) → \(model.selectionTargetLanguageName)")
                     .font(.system(size: 13, weight: .semibold))
                 Text("· \(model.selectionSourceAppName)")
                     .font(.system(size: 11))
@@ -294,11 +294,11 @@ private struct SelectionOverlayView: View {
             .frame(height: 72)
 
             HStack(spacing: 9) {
-                Text(model.selectionStatus)
+                Text(selectionFooterText)
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(model.selectionPhase == .failed ? .red : .secondary)
                     .lineLimit(1)
-                    .help(model.selectionStatus)
+                    .help(selectionFooterText)
                     .accessibilityIdentifier("cpt.selection.status")
 
                 Spacer()
@@ -317,7 +317,7 @@ private struct SelectionOverlayView: View {
                 .accessibilityIdentifier("cpt.selection.copy")
 
                 if model.selectionCanReplace {
-                    Button("替换选区") {
+                    Button("替换原选区") {
                         model.replaceSelectionWithTranslation()
                     }
                     .buttonStyle(.borderedProminent)
@@ -331,6 +331,13 @@ private struct SelectionOverlayView: View {
             width: 430,
             height: model.selectionDisplayMode == .bilingual ? 286 : 218
         )
+    }
+
+    private var selectionFooterText: String {
+        if model.selectionPhase == .translated {
+            return "仅处理当前选区 · 替换前会再次确认焦点和范围"
+        }
+        return model.selectionStatus
     }
 }
 

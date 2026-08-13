@@ -34,6 +34,7 @@
 		10000000000000000000011F /* ScreenTextOCR.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000021F /* ScreenTextOCR.swift */; };
 		100000000000000000000120 /* LiveSubtitleTranslation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000220 /* LiveSubtitleTranslation.swift */; };
 		100000000000000000000121 /* PrivacyAndContentPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000221 /* PrivacyAndContentPolicy.swift */; };
+		100000000000000000000122 /* TranslationPreferenceLearning.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000222 /* TranslationPreferenceLearning.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -77,6 +78,7 @@
 		10000000000000000000021F /* ScreenTextOCR.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenTextOCR.swift; sourceTree = "<group>"; };
 		100000000000000000000220 /* LiveSubtitleTranslation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveSubtitleTranslation.swift; sourceTree = "<group>"; };
 		100000000000000000000221 /* PrivacyAndContentPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivacyAndContentPolicy.swift; sourceTree = "<group>"; };
+		100000000000000000000222 /* TranslationPreferenceLearning.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranslationPreferenceLearning.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -149,6 +151,7 @@
 					10000000000000000000020B /* TargetLanguage.swift */,
 					10000000000000000000020C /* TextDeliveryService.swift */,
 					10000000000000000000020D /* TranslationClient.swift */,
+					100000000000000000000222 /* TranslationPreferenceLearning.swift */,
 					10000000000000000000021F /* ScreenTextOCR.swift */,
 					10000000000000000000021B /* SelectionOverlayController.swift */,
 					100000000000000000000219 /* UniversalSelection.swift */,
@@ -305,6 +308,7 @@
 					10000000000000000000011F /* ScreenTextOCR.swift in Sources */,
 					100000000000000000000120 /* LiveSubtitleTranslation.swift in Sources */,
 					100000000000000000000121 /* PrivacyAndContentPolicy.swift in Sources */,
+					100000000000000000000122 /* TranslationPreferenceLearning.swift in Sources */,
 				);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

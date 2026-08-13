@@ -426,7 +426,13 @@ final class UnifiedEdgeBarController: NSObject {
     private func updateCachedInputState(from target: InputTarget) {
         let source = target.currentTranslationSource()
         cachedHasTranslatableInput = source
-            .map { InputTarget.isTranslatableInputText($0.text, to: model.targetLanguage) } ?? false
+            .map {
+                let targetChoice = model.userInputTargetChoice(for: $0.text)
+                return InputTarget.isTranslatableInputText(
+                    $0.text,
+                    to: targetChoice.language
+                )
+            } ?? false
         cachedUsesSelectedInput = source?.usesSelection ?? false
         cachedCanAttemptInputTranslation = true
         cachedInputIsInferred = false
@@ -640,7 +646,7 @@ final class UnifiedEdgeBarController: NSObject {
         latestResponseSource = response.text
         latestResponseTranslation = ""
         latestResponseLanguageName = response.language.displayName
-        responseStatus = "Translating \(response.language.displayName)..."
+                responseStatus = "正在翻译 \(response.language.displayName)…"
         isTranslatingResponse = true
         holdExpanded(for: 4)
         isExpanded = true
@@ -675,7 +681,7 @@ final class UnifiedEdgeBarController: NSObject {
                       currentApp?.processIdentifier == processIdentifier else { return }
                 translatingResponseIdentity = ""
                 latestResponseTranslation = ""
-                responseStatus = "Auto-translate failed: \(error.localizedDescription)"
+                responseStatus = "自动翻译失败：\(error.localizedDescription)"
                 isTranslatingResponse = false
                 holdExpanded(for: 8)
                 barContentView?.updateState()
@@ -692,7 +698,7 @@ final class UnifiedEdgeBarController: NSObject {
         })
         guard let target = freshlyCapturedTarget ?? currentInputTarget,
               target.hasConcreteTextInput else {
-            model.statusMessage = "Focus the Claude or ChatGPT input field, then try again."
+            model.statusMessage = "请先点进 Claude 或 ChatGPT 的消息输入框，再试一次。"
             inputStatusOverride = "请先点进 AI 输入框"
             inputStatusOverrideExpiresAt = Date().addingTimeInterval(5)
             barContentView?.updateState()
@@ -726,7 +732,12 @@ final class UnifiedEdgeBarController: NSObject {
                 ) else {
                     throw DeliveryError.emptyInput
                 }
-                guard InputTarget.isTranslatableInputText(source.text, to: model.targetLanguage) else {
+                let targetChoice = model.userInputTargetChoice(for: source.text)
+                let translationTarget = targetChoice.language
+                if targetChoice.learned, model.targetLanguage != translationTarget {
+                    model.targetLanguage = translationTarget
+                }
+                guard InputTarget.isTranslatableInputText(source.text, to: translationTarget) else {
                     throw DeliveryError.nonTranslatableInput
                 }
 
@@ -739,7 +750,7 @@ final class UnifiedEdgeBarController: NSObject {
                     barContentView?.updateState()
                 }
 
-                let output = try await translator.translate(source.text, to: model.targetLanguage)
+                let output = try await translator.translate(source.text, to: translationTarget)
                 try Task.checkCancellation()
                 guard currentApp?.processIdentifier == processIdentifier else {
                     throw CancellationError()
@@ -756,13 +767,18 @@ final class UnifiedEdgeBarController: NSObject {
                             && currentApp?.processIdentifier == processIdentifier
                     }
                 )
+                model.recordSuccessfulUserTranslation(
+                    sourceText: source.text,
+                    targetLanguage: translationTarget,
+                    targetWasDeliberatelySelected: !targetChoice.learned
+                )
                 isTranslatingInput = false
                 model.statusMessage = source.usesSelection
-                    ? "Selected text translated."
-                    : "Translated. Review, then press Enter."
+                    ? "选中文字已翻译。"
+                    : "已翻译；请检查草稿后自行按 Enter。"
                 inputStatusOverride = source.usesSelection
                     ? "已翻译选中文字"
-                    : "已替换为\(model.targetLanguage.shortChineseName)"
+                    : "已替换为\(translationTarget.shortChineseName)"
                 inputStatusOverrideExpiresAt = Date().addingTimeInterval(4)
                 holdExpanded(for: 4)
                 barContentView?.updateState()
@@ -775,7 +791,7 @@ final class UnifiedEdgeBarController: NSObject {
             } catch {
                 guard currentApp?.processIdentifier == processIdentifier else { return }
                 isTranslatingInput = false
-                model.statusMessage = "Translation failed: \(error.localizedDescription)"
+                model.statusMessage = "翻译失败：\(error.localizedDescription)"
                 inputStatusOverride = inputTranslationErrorMessage(for: error)
                 inputStatusOverrideExpiresAt = Date().addingTimeInterval(5)
                 forceVisibleUntil = Date().addingTimeInterval(5)

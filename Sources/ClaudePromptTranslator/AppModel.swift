@@ -153,6 +153,15 @@ final class AppModel: ObservableObject {
             )
         }
     }
+    @Published var translationPreferenceLearningEnabled: Bool = true {
+        didSet {
+            UserDefaults.standard.set(
+                translationPreferenceLearningEnabled,
+                forKey: DefaultsKey.translationPreferenceLearningEnabled
+            )
+            refreshTranslationPreferenceLearning()
+        }
+    }
     @Published var targetLanguage: TargetLanguage {
         didSet {
             UserDefaults.standard.set(targetLanguage.rawValue, forKey: DefaultsKey.targetLanguage)
@@ -176,6 +185,8 @@ final class AppModel: ObservableObject {
     @Published var selectionTargetLanguageName = "简体中文"
     @Published var selectionSourceAppName = "当前应用"
     @Published var selectionCanReplace = false
+    @Published private(set) var translationPreferenceLearningSummary = ""
+    @Published private(set) var translationPreferenceObservationCount = 0
     @Published var selectionDisplayMode: SubtitleDisplayMode = .bilingual {
         didSet {
             UserDefaults.standard.set(selectionDisplayMode.rawValue, forKey: DefaultsKey.selectionDisplayMode)
@@ -253,6 +264,7 @@ final class AppModel: ObservableObject {
     private var lastHoverFingerprint = ""
     private var lastHoverDate = Date.distantPast
     private var selectionFilterNote = ""
+    private var translationPreferenceProfile = TranslationPreferenceProfile()
 
     init() {
         let savedTarget = UserDefaults.standard.string(forKey: DefaultsKey.targetLanguage)
@@ -332,6 +344,15 @@ final class AppModel: ObservableObject {
             )
         }
 
+        if UserDefaults.standard.object(forKey: DefaultsKey.translationPreferenceLearningEnabled) == nil {
+            self.translationPreferenceLearningEnabled = true
+        } else {
+            self.translationPreferenceLearningEnabled = UserDefaults.standard.bool(
+                forKey: DefaultsKey.translationPreferenceLearningEnabled
+            )
+        }
+        self.translationPreferenceProfile = TranslationPreferencePersistence.load()
+
         let automaticSelectionPrivacyAcknowledged = UserDefaults.standard.bool(
             forKey: DefaultsKey.automaticSelectionTranslationPrivacyAcknowledged
         )
@@ -376,6 +397,8 @@ final class AppModel: ObservableObject {
         } else {
             self.unifiedBarEnabled = UserDefaults.standard.bool(forKey: DefaultsKey.unifiedBarEnabled)
         }
+
+        refreshTranslationPreferenceLearning()
     }
 
     func showPanel(reason: ShowReason) {
@@ -465,9 +488,9 @@ final class AppModel: ObservableObject {
         case .floatingButton:
             statusMessage = "已识别消息输入框；按 Enter 只写入译文草稿。"
         case .hotkey:
-            statusMessage = "备用草稿窗已打开；不会替你发送消息。"
+            statusMessage = "草稿翻译窗已打开；不会替你发送消息。"
         case .manual:
-            statusMessage = "请输入中文草稿；翻译后只写入目标输入框，不会发送。"
+            statusMessage = "请输入草稿；翻译后只写入目标输入框，不会发送。"
         }
 
         panelController.show()
@@ -643,6 +666,99 @@ final class AppModel: ObservableObject {
         blockedApplicationBundleIdentifiers.sorted()
     }
 
+    func recordSuccessfulUserTranslation(
+        sourceText: String,
+        targetLanguage: TargetLanguage,
+        targetWasDeliberatelySelected: Bool
+    ) {
+        guard translationPreferenceLearningEnabled else { return }
+        let sourceIdentifier = SelectionLanguageRouter.detectedLanguageIdentifier(in: sourceText)
+        recordSuccessfulUserTranslation(
+            detectedSourceIdentifier: sourceIdentifier,
+            targetLanguage: targetLanguage,
+            targetWasDeliberatelySelected: targetWasDeliberatelySelected
+        )
+    }
+
+    func recordSuccessfulUserTranslation(
+        sourceIdentifier: String,
+        targetLanguage: TargetLanguage,
+        targetWasDeliberatelySelected: Bool
+    ) {
+        guard translationPreferenceLearningEnabled else { return }
+        recordSuccessfulUserTranslation(
+            detectedSourceIdentifier: sourceIdentifier,
+            targetLanguage: targetLanguage,
+            targetWasDeliberatelySelected: targetWasDeliberatelySelected
+        )
+    }
+
+    func resetTranslationPreferenceLearning() {
+        translationPreferenceProfile = TranslationPreferenceProfile()
+        TranslationPreferencePersistence.reset()
+        refreshTranslationPreferenceLearning()
+        statusMessage = "本机语言偏好统计已重置；不会影响现有翻译设置。"
+    }
+
+    private func refreshTranslationPreferenceLearning(now: Date = Date()) {
+        if translationPreferenceLearningEnabled {
+            let evaluated = TranslationPreferenceLearningPolicy.evaluated(
+                profile: translationPreferenceProfile,
+                at: now
+            )
+            if evaluated != translationPreferenceProfile {
+                translationPreferenceProfile = evaluated
+                TranslationPreferencePersistence.save(evaluated)
+            }
+        }
+        translationPreferenceObservationCount = translationPreferenceProfile.totalSuccessfulTranslations
+        translationPreferenceLearningSummary = TranslationPreferenceLearningPolicy.summary(
+            profile: translationPreferenceProfile,
+            enabled: translationPreferenceLearningEnabled,
+            now: now
+        )
+    }
+
+    private func recordSuccessfulUserTranslation(
+        detectedSourceIdentifier: String,
+        targetLanguage: TargetLanguage,
+        targetWasDeliberatelySelected: Bool
+    ) {
+        translationPreferenceProfile = TranslationPreferenceLearningPolicy.record(
+            profile: translationPreferenceProfile,
+            sourceIdentifier: detectedSourceIdentifier,
+            targetLanguage: targetLanguage,
+            at: Date(),
+            deliberateTargetWeight: targetWasDeliberatelySelected ? 3 : 1
+        )
+        TranslationPreferencePersistence.save(translationPreferenceProfile)
+        refreshTranslationPreferenceLearning()
+
+    }
+
+    func userInputTargetChoice(
+        for sourceText: String
+    ) -> (language: TargetLanguage, learned: Bool) {
+        guard automaticLanguageRoutingEnabled,
+              translationPreferenceLearningEnabled else {
+            return (targetLanguage, false)
+        }
+        let sourceIdentifier = SelectionLanguageRouter.detectedLanguageIdentifier(in: sourceText)
+        if let learnedTarget = TranslationPreferenceLearningPolicy.preferredTarget(
+            for: sourceIdentifier,
+            profile: translationPreferenceProfile
+        ) {
+            return (learnedTarget, true)
+        }
+        if TranslationPreferenceLearningPolicy.canonicalSourceIdentifier(sourceIdentifier) == nil,
+           let learnedDefault = TranslationPreferenceLearningPolicy.preferredDefaultTarget(
+                profile: translationPreferenceProfile
+           ) {
+            return (learnedDefault, true)
+        }
+        return (targetLanguage, false)
+    }
+
     private func privacyBlockedMessage(for app: NSRunningApplication) -> String {
         "隐私名单已禁止读取 \(app.localizedName ?? app.bundleIdentifier ?? "此应用")。"
     }
@@ -658,8 +774,16 @@ final class AppModel: ObservableObject {
             return
         }
 
+        let targetChoice = userInputTargetChoice(for: source)
+        let translationTarget = targetChoice.language
+        if targetChoice.learned, targetLanguage != translationTarget {
+            targetLanguage = translationTarget
+        }
+
         isTranslating = true
-        statusMessage = "正在翻译为\(targetLanguage.displayName)…"
+        statusMessage = targetChoice.learned
+            ? "已按两周本机习惯选择\(translationTarget.displayName)，正在翻译…"
+            : "正在翻译为\(translationTarget.displayName)…"
         let deliveryTarget = lastInputTarget
         guard deliveryTarget.map({ isCaptureAllowed(in: $0.app) }) ?? true else {
             statusMessage = deliveryTarget.map { privacyBlockedMessage(for: $0.app) }
@@ -684,7 +808,7 @@ final class AppModel: ObservableObject {
                     throw DeliveryError.accessibilityPermissionRequired
                 }
 
-                let output = try await translator.translate(source, to: targetLanguage)
+                let output = try await translator.translate(source, to: translationTarget)
                 try Task.checkCancellation()
                 guard TranslationOperationSafety.canContinue(
                     expectedGeneration: generation,
@@ -720,6 +844,11 @@ final class AppModel: ObservableObject {
                 ) else {
                     throw CancellationError()
                 }
+                recordSuccessfulUserTranslation(
+                    sourceText: source,
+                    targetLanguage: translationTarget,
+                    targetWasDeliberatelySelected: !targetChoice.learned
+                )
                 promptText = ""
                 statusMessage = "已写入 \(deliveryTarget.appName) 草稿；请检查后自行决定是否发送。"
                 collapsePanelForNextPrompt()
@@ -847,7 +976,7 @@ final class AppModel: ObservableObject {
                 present(selection)
                 selectionStatus = "本机 OCR 识别 \(result.lineCount) 行 · 未保存截图"
                 selectionOverlayController.refresh()
-                beginTranslation(for: selection)
+                beginTranslation(for: selection, learnsPreference: true)
             } catch is CancellationError {
                 return
             } catch {
@@ -1022,7 +1151,7 @@ final class AppModel: ObservableObject {
                     return
                 }
                 present(selection)
-                beginTranslation(for: selection)
+                beginTranslation(for: selection, learnsPreference: true)
             } catch is CancellationError {
                 return
             } catch {
@@ -1074,7 +1203,7 @@ final class AppModel: ObservableObject {
             translateCurrentSelection()
             return
         }
-        beginTranslation(for: detectedSelection)
+        beginTranslation(for: detectedSelection, learnsPreference: true)
     }
 
     func copySelectionTranslation() {
@@ -1245,7 +1374,7 @@ final class AppModel: ObservableObject {
                 present(selection)
                 selectionFilterNote = filtered.note
                 if automaticSelectionTranslationEnabled {
-                    beginTranslation(for: selection)
+                    beginTranslation(for: selection, learnsPreference: false)
                 }
             } catch {
                 // Passive detection is deliberately silent. The explicit hotkey
@@ -1283,7 +1412,7 @@ final class AppModel: ObservableObject {
             selectionTranslationTask?.cancel()
             present(selection)
             selectionFilterNote = filtered.note
-            beginTranslation(for: selection)
+            beginTranslation(for: selection, learnsPreference: false)
         }
     }
 
@@ -1383,7 +1512,10 @@ final class AppModel: ObservableObject {
         responseSelectionExpiryTask = nil
     }
 
-    private func beginTranslation(for selection: UniversalTextSelection) {
+    private func beginTranslation(
+        for selection: UniversalTextSelection,
+        learnsPreference: Bool
+    ) {
         selectionTranslationTask?.cancel()
         selectionGeneration += 1
         let generation = selectionGeneration
@@ -1417,6 +1549,13 @@ final class AppModel: ObservableObject {
                 selectionStatus = "\(output.providerName) · \(route.sourceDisplayName) → \(route.targetLanguage.displayName)\(selectionFilterNote)"
                 selectionPhase = .translated
                 selectionCanReplace = selection.canReplace
+                if learnsPreference {
+                    recordSuccessfulUserTranslation(
+                        sourceIdentifier: route.sourceIdentifier,
+                        targetLanguage: route.targetLanguage,
+                        targetWasDeliberatelySelected: !automaticLanguageRoutingEnabled
+                    )
+                }
                 SelectionDiagnostics.record("translation succeeded provider=\(output.providerName)")
                 selectionOverlayController.refresh()
             } catch is CancellationError {
@@ -1433,9 +1572,16 @@ final class AppModel: ObservableObject {
     }
 
     private func languageRoute(for text: String) -> SelectionLanguageRoute {
-        SelectionLanguageRouter.route(
+        let sourceIdentifier = SelectionLanguageRouter.detectedLanguageIdentifier(in: text)
+        let learnedTarget = translationPreferenceLearningEnabled
+            ? TranslationPreferenceLearningPolicy.preferredTarget(
+                for: sourceIdentifier,
+                profile: translationPreferenceProfile
+            )
+            : nil
+        return SelectionLanguageRouter.route(
             for: text,
-            manualTarget: automaticLanguageRoutingEnabled ? nil : targetLanguage
+            manualTarget: automaticLanguageRoutingEnabled ? learnedTarget : targetLanguage
         )
     }
 
@@ -1533,7 +1679,12 @@ final class AppModel: ObservableObject {
                 ) else {
                     throw DeliveryError.emptyInput
                 }
-                guard InputTarget.isTranslatableInputText(source.text, to: targetLanguage) else {
+                let targetChoice = userInputTargetChoice(for: source.text)
+                let translationTarget = targetChoice.language
+                if targetChoice.learned, targetLanguage != translationTarget {
+                    targetLanguage = translationTarget
+                }
+                guard InputTarget.isTranslatableInputText(source.text, to: translationTarget) else {
                     throw DeliveryError.nonTranslatableInput
                 }
 
@@ -1544,10 +1695,12 @@ final class AppModel: ObservableObject {
                     statusMessage = "正在按顺序翻译长文本（\(segmentCount) 段）…"
                 } else {
                     statusMessage = source.usesSelection
-                        ? "正在把选中文字翻译为\(targetLanguage.displayName)…"
-                        : "正在翻译为\(targetLanguage.displayName)…"
+                        ? "正在把选中文字翻译为\(translationTarget.displayName)…"
+                        : (targetChoice.learned
+                            ? "已按两周本机习惯选择\(translationTarget.displayName)，正在翻译…"
+                            : "正在翻译为\(translationTarget.displayName)…")
                 }
-                let output = try await translator.translate(source.text, to: targetLanguage)
+                let output = try await translator.translate(source.text, to: translationTarget)
                 try Task.checkCancellation()
                 guard TranslationOperationSafety.canContinue(
                     expectedGeneration: generation,
@@ -1577,6 +1730,11 @@ final class AppModel: ObservableObject {
                 ), isCaptureAllowed(in: target.app) else {
                     throw CancellationError()
                 }
+                recordSuccessfulUserTranslation(
+                    sourceText: source.text,
+                    targetLanguage: translationTarget,
+                    targetWasDeliberatelySelected: !targetChoice.learned
+                )
                 statusMessage = source.usesSelection
                     ? "已翻译 \(target.appName) 中的选中文字。"
                     : "译文已写入 \(target.appName) 草稿；检查后请自行决定是否发送。"
@@ -1704,6 +1862,7 @@ private enum DefaultsKey {
     static let subtitleFontSize = "subtitleFontSize"
     static let selectionDisplayMode = "selectionDisplayMode"
     static let automaticLanguageRoutingEnabled = "automaticLanguageRoutingEnabled"
+    static let translationPreferenceLearningEnabled = "translationPreferenceLearningEnabled"
     static let unifiedBarEnabled = "unifiedBarEnabled"
     static let appTheme = "appTheme"
     static let inlineModeMigration = "inlineModeMigration"

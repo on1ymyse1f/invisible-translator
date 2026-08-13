@@ -256,6 +256,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         configureStatusItem()
     }
 
+    @objc private func toggleTranslationPreferenceLearning(_ sender: NSMenuItem) {
+        model.translationPreferenceLearningEnabled.toggle()
+        model.statusMessage = model.translationPreferenceLearningEnabled
+            ? "本机语言偏好学习已开启；只记录评估时间、语言方向和聚合次数。"
+            : "本机语言偏好学习已关闭；现有统计已保留。"
+        configureStatusItem()
+    }
+
+    @objc private func resetTranslationPreferenceLearning() {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "重置本机语言偏好？"
+        alert.informativeText = "将删除已记录的评估时间、语言方向、聚合次数和两周评估结果。不会影响翻译设置，也不涉及任何原文或译文。"
+        alert.addButton(withTitle: "重置")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        model.resetTranslationPreferenceLearning()
+        configureStatusItem()
+    }
+
     @objc private func toggleAutomaticSelectionTranslation(_ sender: NSMenuItem) {
         if model.automaticSelectionTranslationEnabled {
             model.automaticSelectionTranslationEnabled = false
@@ -456,22 +476,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if model.translatorEnabled, model.unifiedBarEnabled {
             model.unifiedBarController.start()
             model.revealEdgeBar()
-            model.statusMessage = "Edge bar restarted."
+            model.statusMessage = "边缘栏已重启。"
         } else {
-            model.statusMessage = "Edge bar is disabled."
+            model.statusMessage = "边缘栏当前已关闭。"
         }
         configureStatusItem()
     }
 
     @objc private func refreshStatusMenu() {
-        model.statusMessage = "Menu state refreshed."
+        model.statusMessage = "菜单状态已刷新。"
         configureStatusItem()
     }
 
     @objc private func copyDebugInfo() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(debugInfoText(), forType: .string)
-        model.statusMessage = "Debug info copied."
+        model.statusMessage = "脱敏诊断已复制。"
         configureStatusItem()
     }
 
@@ -633,6 +653,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         automaticLanguageItem.isEnabled = model.translatorEnabled
         menu.addItem(automaticLanguageItem)
 
+        let preferenceLearningMenu = NSMenu(title: "本机语言偏好学习")
+        let preferenceLearningToggle = NSMenuItem(
+            title: "启用本机语言偏好学习",
+            action: #selector(toggleTranslationPreferenceLearning(_:)),
+            keyEquivalent: ""
+        )
+        preferenceLearningToggle.state = model.translationPreferenceLearningEnabled ? .on : .off
+        preferenceLearningMenu.addItem(preferenceLearningToggle)
+        preferenceLearningMenu.addItem(disabledMenuItem(model.translationPreferenceLearningSummary))
+        preferenceLearningMenu.addItem(.separator())
+        let resetPreferenceItem = NSMenuItem(
+            title: "重置学习数据（\(model.translationPreferenceObservationCount) 次）",
+            action: #selector(resetTranslationPreferenceLearning),
+            keyEquivalent: ""
+        )
+        resetPreferenceItem.isEnabled = model.translationPreferenceObservationCount > 0
+        preferenceLearningMenu.addItem(resetPreferenceItem)
+        let preferenceLearningItem = NSMenuItem(
+            title: "语言偏好学习：\(model.translationPreferenceLearningEnabled ? "开启" : "关闭")",
+            action: nil,
+            keyEquivalent: ""
+        )
+        preferenceLearningItem.submenu = preferenceLearningMenu
+        menu.addItem(preferenceLearningItem)
+
         let contentFilterMenu = NSMenu(title: "内容筛选")
         for (title, level, action) in [
             ("关闭", ContentFilterLevel.off, #selector(chooseContentFilterOff)),
@@ -709,11 +754,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         chineseItem.state = model.targetLanguage == .simplifiedChinese ? .on : .off
         targetMenu.addItem(chineseItem)
 
-        let englishItem = NSMenuItem(title: "English", action: #selector(chooseEnglish), keyEquivalent: "")
+        let englishItem = NSMenuItem(title: "英语", action: #selector(chooseEnglish), keyEquivalent: "")
         englishItem.state = model.targetLanguage == .english ? .on : .off
         targetMenu.addItem(englishItem)
 
-        let japaneseItem = NSMenuItem(title: "Japanese", action: #selector(chooseJapanese), keyEquivalent: "")
+        let japaneseItem = NSMenuItem(title: "日语", action: #selector(chooseJapanese), keyEquivalent: "")
         japaneseItem.state = model.targetLanguage == .japanese ? .on : .off
         targetMenu.addItem(japaneseItem)
         let targetTitle = model.automaticLanguageRoutingEnabled
@@ -735,7 +780,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let tokyoBlueThemeItem = NSMenuItem(title: AppTheme.tokyoBlue.menuTitle, action: #selector(chooseTokyoBlueTheme), keyEquivalent: "")
         tokyoBlueThemeItem.state = model.appTheme == .tokyoBlue ? .on : .off
         themeMenu.addItem(tokyoBlueThemeItem)
-        let themeItem = NSMenuItem(title: "外观: \(model.appTheme.displayName)", action: nil, keyEquivalent: "")
+        let themeItem = NSMenuItem(title: "外观：\(model.appTheme.displayName)", action: nil, keyEquivalent: "")
         themeItem.submenu = themeMenu
         menu.addItem(themeItem)
 
@@ -817,7 +862,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(diagnosticsItem)
 
         let moreMenu = NSMenu()
-        moreMenu.addItem(NSMenuItem(title: "打开备用草稿窗（高级）", action: #selector(showInputPanel), keyEquivalent: ""))
+        moreMenu.addItem(NSMenuItem(title: "打开草稿翻译窗（高级）", action: #selector(showInputPanel), keyEquivalent: ""))
         let copyLastItem = NSMenuItem(title: "复制上次译文", action: #selector(copyLastTranslation), keyEquivalent: "")
         copyLastItem.isEnabled = model.translatorEnabled && !model.lastTranslation.isEmpty
         moreMenu.addItem(copyLastItem)
@@ -920,11 +965,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Live subtitle translation active: \(model.subtitleTranslationActive)
         Subtitle display mode: \(model.subtitleDisplayMode.displayName)
         Automatic language routing enabled: \(model.automaticLanguageRoutingEnabled)
+        Translation preference learning enabled: \(model.translationPreferenceLearningEnabled)
+        Translation preference aggregate event count: \(model.translationPreferenceObservationCount)
         Clipboard compatibility enabled: \(model.clipboardCompatibilityEnabled)
         Auto AI detection enabled: \(model.autoShowWhenClaudeIsActive)
         Response translation enabled: \(model.responseTranslationEnabled)
         Target language: \(model.targetLanguage.displayName)
-        Theme: \(model.appTheme.displayName)
+        Appearance: \(model.appTheme.displayName)
         Accessibility trusted: \(AccessibilityPermission.isTrusted)
         Screen recording trusted (explicit region OCR/subtitles/reply OCR retry only): \(ScreenRecordingPermission.isGranted)
         Response translation active: \(model.hasResponseTranslationActivity)
@@ -1093,7 +1140,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         model.rememberTarget(app)
-        model.statusMessage = "AI chat detected. Move near the window edge for translation controls."
+        model.statusMessage = "已识别 AI 对话；将鼠标移到窗口边缘显示翻译控制。"
         let revealIsStale = lastAutoRevealAt.map { Date().timeIntervalSince($0) > 12 } ?? true
         if forceReveal || lastAutoRevealedProcessIdentifier != app.processIdentifier || revealIsStale {
             lastAutoRevealedProcessIdentifier = app.processIdentifier
@@ -1109,7 +1156,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         switch url.host {
         case "translate":
-            model.statusMessage = "For safety, URL links can only show the edge bar. Use the button or hotkey to translate."
+            model.statusMessage = "为避免误操作，链接只会打开边缘栏；请使用按钮或快捷键开始翻译。"
             model.revealEdgeBar()
         case "show", "input":
             model.revealEdgeBar()
@@ -1125,7 +1172,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if url.path == "/show" || url.path == "/input" {
                 model.revealEdgeBar()
             } else if url.path == "/translate" {
-                model.statusMessage = "For safety, URL links can only show the edge bar. Use the button or hotkey to translate."
+                model.statusMessage = "为避免误操作，链接只会打开边缘栏；请使用按钮或快捷键开始翻译。"
                 model.revealEdgeBar()
             }
         }
@@ -1177,12 +1224,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         switch action {
         case "translate":
-            model.statusMessage = "External requests can only show the edge bar. Use the button or hotkey to translate."
+            model.statusMessage = "外部请求只会打开边缘栏；请使用按钮或快捷键开始翻译。"
             model.revealEdgeBar()
         case "show":
             model.revealEdgeBar()
         default:
-            model.statusMessage = "Prompt Translator is already running in the menu bar."
+            model.statusMessage = "无感翻译已在菜单栏运行。"
         }
     }
 

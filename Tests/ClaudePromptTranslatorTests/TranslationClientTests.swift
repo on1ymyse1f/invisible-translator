@@ -59,6 +59,198 @@ final class TranslationClientTests: XCTestCase {
         XCTAssertEqual(route.targetLanguage, .japanese)
     }
 
+    func testTranslationPreferenceLearningWaitsForFullFourteenDays() {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        var profile = TranslationPreferenceProfile()
+        for offset in 0..<8 {
+            profile = TranslationPreferenceLearningPolicy.record(
+                profile: profile,
+                sourceIdentifier: "en-US",
+                targetLanguage: .japanese,
+                at: start.addingTimeInterval(TimeInterval(offset)),
+                deliberateTargetWeight: 1
+            )
+        }
+
+        let tooEarly = TranslationPreferenceLearningPolicy.evaluated(
+            profile: profile,
+            at: start.addingTimeInterval(13 * 24 * 60 * 60 + 86_399)
+        )
+
+        XCTAssertNil(
+            TranslationPreferenceLearningPolicy.preferredTarget(
+                for: "en",
+                profile: tooEarly
+            )
+        )
+        XCTAssertNil(tooEarly.lastEvaluatedAt)
+    }
+
+    func testTranslationPreferenceLearningAppliesConfidentPerSourceTargetsAfterTwoWeeks() {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        var profile = TranslationPreferenceProfile()
+        for offset in 0..<4 {
+            profile = TranslationPreferenceLearningPolicy.record(
+                profile: profile,
+                sourceIdentifier: "en-US",
+                targetLanguage: .japanese,
+                at: start.addingTimeInterval(TimeInterval(offset)),
+                deliberateTargetWeight: 3
+            )
+            profile = TranslationPreferenceLearningPolicy.record(
+                profile: profile,
+                sourceIdentifier: "zh-Hans",
+                targetLanguage: .english,
+                at: start.addingTimeInterval(TimeInterval(10 + offset)),
+                deliberateTargetWeight: 3
+            )
+        }
+
+        profile = TranslationPreferenceLearningPolicy.evaluated(
+            profile: profile,
+            at: start.addingTimeInterval(14 * 24 * 60 * 60)
+        )
+
+        XCTAssertEqual(profile.totalSuccessfulTranslations, 8)
+        XCTAssertEqual(
+            TranslationPreferenceLearningPolicy.preferredTarget(for: "en-GB", profile: profile),
+            .japanese
+        )
+        XCTAssertEqual(
+            TranslationPreferenceLearningPolicy.preferredTarget(for: "zh-CN", profile: profile),
+            .english
+        )
+        XCTAssertNil(TranslationPreferenceLearningPolicy.preferredDefaultTarget(profile: profile))
+    }
+
+    func testTranslationPreferenceLearningRejectsLowConfidenceAndSparseSamples() {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        var profile = TranslationPreferenceProfile()
+        for offset in 0..<5 {
+            profile = TranslationPreferenceLearningPolicy.record(
+                profile: profile,
+                sourceIdentifier: "en",
+                targetLanguage: .simplifiedChinese,
+                at: start.addingTimeInterval(TimeInterval(offset)),
+                deliberateTargetWeight: 1
+            )
+        }
+        for offset in 0..<3 {
+            profile = TranslationPreferenceLearningPolicy.record(
+                profile: profile,
+                sourceIdentifier: "en",
+                targetLanguage: .japanese,
+                at: start.addingTimeInterval(TimeInterval(20 + offset)),
+                deliberateTargetWeight: 1
+            )
+        }
+
+        profile = TranslationPreferenceLearningPolicy.evaluated(
+            profile: profile,
+            at: start.addingTimeInterval(15 * 24 * 60 * 60)
+        )
+
+        XCTAssertNil(
+            TranslationPreferenceLearningPolicy.preferredTarget(for: "en", profile: profile)
+        )
+        XCTAssertNil(TranslationPreferenceLearningPolicy.preferredDefaultTarget(profile: profile))
+    }
+
+    func testTranslationPreferenceLearningRequiresEightOverallEvents() {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        var profile = TranslationPreferenceProfile()
+        for offset in 0..<4 {
+            profile = TranslationPreferenceLearningPolicy.record(
+                profile: profile,
+                sourceIdentifier: "en",
+                targetLanguage: .japanese,
+                at: start.addingTimeInterval(TimeInterval(offset)),
+                deliberateTargetWeight: 3
+            )
+        }
+
+        profile = TranslationPreferenceLearningPolicy.evaluated(
+            profile: profile,
+            at: start.addingTimeInterval(14 * 24 * 60 * 60)
+        )
+
+        XCTAssertEqual(profile.totalSuccessfulTranslations, 4)
+        XCTAssertNotNil(profile.lastEvaluatedAt)
+        XCTAssertNil(
+            TranslationPreferenceLearningPolicy.preferredTarget(for: "en", profile: profile)
+        )
+        XCTAssertNil(TranslationPreferenceLearningPolicy.preferredDefaultTarget(profile: profile))
+    }
+
+    func testTranslationPreferenceLearningRemovesAStalePreferenceWhenHabitsBecomeAmbiguous() {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        let evaluationDate = start.addingTimeInterval(14 * 24 * 60 * 60)
+        var profile = TranslationPreferenceProfile()
+        for offset in 0..<4 {
+            profile = TranslationPreferenceLearningPolicy.record(
+                profile: profile,
+                sourceIdentifier: "en",
+                targetLanguage: .japanese,
+                at: start.addingTimeInterval(TimeInterval(offset)),
+                deliberateTargetWeight: 3
+            )
+        }
+        profile = TranslationPreferenceLearningPolicy.evaluated(
+            profile: profile,
+            at: evaluationDate
+        )
+        XCTAssertEqual(
+            TranslationPreferenceLearningPolicy.preferredTarget(for: "en", profile: profile),
+            .japanese
+        )
+
+        for offset in 0..<4 {
+            profile = TranslationPreferenceLearningPolicy.record(
+                profile: profile,
+                sourceIdentifier: "en",
+                targetLanguage: .simplifiedChinese,
+                at: evaluationDate.addingTimeInterval(TimeInterval(offset + 1)),
+                deliberateTargetWeight: 3
+            )
+        }
+
+        XCTAssertNil(
+            TranslationPreferenceLearningPolicy.preferredTarget(for: "en", profile: profile)
+        )
+        XCTAssertNil(TranslationPreferenceLearningPolicy.preferredDefaultTarget(profile: profile))
+    }
+
+    func testTranslationPreferencePersistenceStoresOnlyAggregateProfileAndResets() throws {
+        let suiteName = "ClaudePromptTranslatorTests.preferences.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let profile = TranslationPreferenceProfile(
+            firstRecordedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            totalSuccessfulTranslations: 4,
+            targetEventCounts: [TargetLanguage.english.rawValue: 4],
+            targetScores: [TargetLanguage.english.rawValue: 12],
+            pairEventCounts: ["zh>en": 4],
+            pairScores: ["zh>en": 12]
+        )
+
+        TranslationPreferencePersistence.save(profile, to: defaults)
+        XCTAssertEqual(TranslationPreferencePersistence.load(from: defaults), profile)
+        let storedData = try XCTUnwrap(
+            defaults.data(forKey: TranslationPreferencePersistence.profileKey)
+        )
+        let storedJSON = try XCTUnwrap(String(data: storedData, encoding: .utf8))
+        XCTAssertFalse(storedJSON.contains("sourceText"))
+        XCTAssertFalse(storedJSON.contains("translationText"))
+        XCTAssertFalse(storedJSON.contains("applicationName"))
+        XCTAssertFalse(storedJSON.contains("windowTitle"))
+
+        TranslationPreferencePersistence.reset(in: defaults)
+        XCTAssertEqual(
+            TranslationPreferencePersistence.load(from: defaults),
+            TranslationPreferenceProfile()
+        )
+    }
+
     func testUniversalSelectionNormalizerRejectsEmptyPunctuationAndOversizedText() {
         XCTAssertNil(SelectionTextNormalizer.normalizedText(from: "  \n "))
         XCTAssertNil(SelectionTextNormalizer.normalizedText(from: "…!?"))

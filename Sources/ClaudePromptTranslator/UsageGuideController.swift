@@ -8,6 +8,9 @@ struct AppHealthSnapshot: Equatable {
     let translatorEnabled: Bool
     let selectionDetectionEnabled: Bool
     let automaticLanguageRoutingEnabled: Bool
+    let translationPreferenceLearningEnabled: Bool
+    let translationPreferenceLearningSummary: String
+    let translationPreferenceObservationCount: Int
     let aiInputTargetLanguageName: String
     let clipboardCompatibilityEnabled: Bool
     let unifiedBarEnabled: Bool
@@ -40,6 +43,9 @@ struct AppHealthSnapshot: Equatable {
             translatorEnabled: model.translatorEnabled,
             selectionDetectionEnabled: model.selectionDetectionEnabled,
             automaticLanguageRoutingEnabled: model.automaticLanguageRoutingEnabled,
+            translationPreferenceLearningEnabled: model.translationPreferenceLearningEnabled,
+            translationPreferenceLearningSummary: model.translationPreferenceLearningSummary,
+            translationPreferenceObservationCount: model.translationPreferenceObservationCount,
             aiInputTargetLanguageName: model.targetLanguage.shortChineseName,
             clipboardCompatibilityEnabled: model.clipboardCompatibilityEnabled,
             unifiedBarEnabled: model.unifiedBarEnabled,
@@ -138,6 +144,8 @@ private final class UsageGuideState: ObservableObject {
         Translator enabled: \(snapshot.translatorEnabled)
         Selection detection enabled: \(snapshot.selectionDetectionEnabled)
         Automatic language routing: \(snapshot.automaticLanguageRoutingEnabled)
+        Translation preference learning: \(snapshot.translationPreferenceLearningEnabled)
+        Translation preference aggregate event count: \(snapshot.translationPreferenceObservationCount)
         AI input target language: \(snapshot.aiInputTargetLanguageName)
         Clipboard compatibility: \(snapshot.clipboardCompatibilityEnabled)
         AI edge bar: \(snapshot.unifiedBarEnabled)
@@ -147,6 +155,19 @@ private final class UsageGuideState: ObservableObject {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(report, forType: .string)
         actionMessage = "脱敏诊断已复制；其中不含原文、译文、应用名或窗口标题。"
+    }
+
+    func confirmAndResetTranslationPreferenceLearning() {
+        let alert = NSAlert()
+        alert.messageText = "重置本机语言偏好统计？"
+        alert.informativeText = "这会删除已累计的评估时间、语言代码、方向和聚合次数，并从下一次成功的主动翻译重新开始 14 天评估。此操作不会删除其他设置。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "重置统计")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        model.resetTranslationPreferenceLearning()
+        refresh(message: "本机语言偏好统计已重置。")
     }
 }
 
@@ -352,6 +373,8 @@ private struct UsageGuideView: View {
             VStack(alignment: .leading, spacing: 18) {
                 header
                 readinessBanner
+                principlesSection
+                preferenceLearningSection
                 permissionCards
                 workflowSection
                 privacySection
@@ -374,7 +397,7 @@ private struct UsageGuideView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("无感翻译")
                     .font(.system(size: 24, weight: .bold))
-                Text("选区、悬停、区域 OCR 与视频字幕翻译；默认只使用 Apple 设备端语言包。")
+                Text("先确认目标，再翻译；结果可见、写入可控、发送始终由你决定。")
                     .foregroundStyle(.secondary)
             }
 
@@ -410,6 +433,31 @@ private struct UsageGuideView: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill((snapshot.selectionReady ? Color.green : Color.orange).opacity(0.10))
         )
+    }
+
+    private var principlesSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("三条默认原则")
+                .font(.title3.weight(.semibold))
+
+            HStack(alignment: .top, spacing: 10) {
+                principleCard(
+                    systemImage: "scope",
+                    title: "只处理明确目标",
+                    detail: "先确认选区或消息输入框，再读取文字。"
+                )
+                principleCard(
+                    systemImage: "eye",
+                    title: "结果先展示",
+                    detail: "译文先在浮层中可见，替换和复制都由你点击。"
+                )
+                principleCard(
+                    systemImage: "lock.shield",
+                    title: "默认不外发",
+                    detail: "Apple 本机翻译；剪贴板与 OCR 都需要明确开启。"
+                )
+            }
+        }
     }
 
     private var permissionCards: some View {
@@ -457,6 +505,55 @@ private struct UsageGuideView: View {
         }
     }
 
+    private var preferenceLearningSection: some View {
+        HStack(alignment: .top, spacing: 13) {
+            Image(systemName: "brain.head.profile")
+                .font(.title2)
+                .foregroundStyle(.tint)
+                .frame(width: 32)
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text("两周本机语言偏好")
+                    .font(.headline)
+                Text("从第一次成功的主动翻译开始计时；满 14 天且至少 8 次、某方向达到 67% 后，自动语言路由才会采用该偏好。只保存评估时间、语言代码和聚合次数/分数，不保存原文、译文、App 或窗口信息。自动回复、悬停和字幕不会计入。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(model.translationPreferenceLearningSummary)
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(
+                        Color(nsColor: model.translationPreferenceLearningEnabled
+                            ? .controlAccentColor
+                            : .secondaryLabelColor)
+                    )
+                    .accessibilityIdentifier("cpt.setup.preference-summary")
+            }
+
+            Spacer(minLength: 12)
+
+            VStack(alignment: .trailing, spacing: 8) {
+                Toggle("启用", isOn: $model.translationPreferenceLearningEnabled)
+                    .toggleStyle(.switch)
+                    .accessibilityIdentifier("cpt.setup.preference-toggle")
+                Button("重置统计") {
+                    state.confirmAndResetTranslationPreferenceLearning()
+                }
+                .controlSize(.small)
+                .disabled(model.translationPreferenceObservationCount == 0)
+                .accessibilityIdentifier("cpt.setup.preference-reset")
+            }
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color.accentColor.opacity(0.08))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.accentColor.opacity(0.16), lineWidth: 1)
+        )
+    }
+
     private var workflowSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("完整使用链路")
@@ -465,7 +562,7 @@ private struct UsageGuideView: View {
             workflowRow(
                 number: "1",
                 title: "任意 App 选区翻译",
-                detail: "选中文字 → 点击选区旁“翻译”或按 ⌃⌥T → 复制译文；仅当焦点、窗口、精确范围和原文都未变化时才可替换。"
+                detail: "选中文字 → 点击“翻译选区”或按 ⌃⌥T → 先查看译文；只有焦点、窗口和原文都未变化时才可替换。"
             ) {
                 Button("打开合成测试文本") { onOpenSyntheticTest() }
                     .buttonStyle(.borderedProminent)
@@ -475,7 +572,7 @@ private struct UsageGuideView: View {
             workflowRow(
                 number: "2",
                 title: "AI 输入草稿翻译",
-                detail: "先点进 ChatGPT / Claude 的消息输入框并输入草稿，再点击边缘栏“翻译输入”。只替换选中内容或草稿，不会按 Enter、不会发送。"
+                detail: "先点进 ChatGPT / Claude 的消息输入框，再点击“翻译输入”。只写入草稿，不按 Enter、不发送。"
             ) {
                 if state.runningAIApplications.isEmpty {
                     Button("显示 AI 兼容边缘栏") { onShowAIBar(nil) }
@@ -498,7 +595,7 @@ private struct UsageGuideView: View {
             workflowRow(
                 number: "3",
                 title: "AI 回复翻译",
-                detail: "优先选中回复后点“译回复”；否则通过辅助功能读取最新 assistant 回复。第一次失败只提示，只有再次点“使用 OCR 重试”才会请求屏幕录制。"
+                detail: "优先选中 assistant 回复；没有选区时读取最新可见回复。第一次失败只提示，再次点击才会请求 OCR。"
             ) {
                 VStack(alignment: .trailing, spacing: 6) {
                     Button(responseTranslationButtonTitle) { onTranslateAIResponse() }
@@ -536,7 +633,7 @@ private struct UsageGuideView: View {
             workflowRow(
                 number: "4",
                 title: "悬停与图片 / Canvas OCR",
-                detail: "菜单栏可开启“鼠标悬停翻译”；它只读静态 AX 文字并排除输入框。无法暴露文字的图片或 Canvas，请用“框选屏幕文字（OCR）”。"
+                detail: "悬停只读取静态 AX 文字并排除输入框；图片或 Canvas 请主动框选 OCR。"
             ) {
                 Button("打开合成 OCR 测试") { onOpenSyntheticOCRTest() }
                     .accessibilityIdentifier("cpt.setup.synthetic-ocr")
@@ -545,7 +642,7 @@ private struct UsageGuideView: View {
             workflowRow(
                 number: "5",
                 title: "视频字幕翻译",
-                detail: "菜单栏 → 视频字幕翻译 → 框选固定字幕区域。应用只重复识别该区域，相同字幕稳定两帧后翻译；可选双语/仅译文和三种样式。"
+                detail: "框选固定字幕区域；相同画面稳定后翻译。可选双语/仅译文和字幕样式。"
             ) {
                 Button("打开合成字幕测试") { onOpenSyntheticSubtitleTest() }
                     .accessibilityIdentifier("cpt.setup.synthetic-subtitle")
@@ -639,6 +736,30 @@ private struct UsageGuideView: View {
         )
         .overlay(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+        )
+    }
+
+    private func principleCard(systemImage: String, title: String, detail: String) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Image(systemName: systemImage)
+                .font(.title3)
+                .foregroundStyle(.tint)
+            Text(title)
+                .font(.headline)
+            Text(detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, minHeight: 118, alignment: .topLeading)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color(nsColor: .controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .stroke(Color.primary.opacity(0.08), lineWidth: 1)
         )
     }

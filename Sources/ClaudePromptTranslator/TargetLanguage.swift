@@ -14,9 +14,9 @@ enum TargetLanguage: String, CaseIterable, Identifiable {
         case .simplifiedChinese:
             return "简体中文"
         case .english:
-            return "English"
+            return "英语"
         case .japanese:
-            return "Japanese"
+            return "日语"
         }
     }
 
