@@ -177,6 +177,34 @@ verify_dsym_matches_binary() {
   fi
 }
 
+remove_linker_adhoc_signature_before_strip() {
+  local binary_path="$1"
+  local component_name="$2"
+  local signing_details
+
+  if ! signing_details="$(codesign -d --verbose=4 "${binary_path}" 2>&1)"; then
+    return 0
+  fi
+
+  # Recent arm64 Swift linkers can add a content-free ad-hoc signature to a
+  # command-line executable even when no signing identity was requested. It is
+  # safe to remove only that exact scratch-build signature before stripping;
+  # any identity-bearing or otherwise pre-signed input remains a hard failure.
+  if ! /usr/bin/grep -Fq 'Signature=adhoc' <<<"${signing_details}" \
+      || ! /usr/bin/grep -Eq 'flags=.*\([^)]*linker-signed[^)]*\)' <<<"${signing_details}" \
+      || ! /usr/bin/grep -Fq 'TeamIdentifier=not set' <<<"${signing_details}" \
+      || /usr/bin/grep -Fq 'Authority=' <<<"${signing_details}"; then
+    echo "Refusing to strip a pre-signed ${component_name}." >&2
+    exit 1
+  fi
+
+  codesign --remove-signature "${binary_path}"
+  if codesign -d --verbose=2 "${binary_path}" >/dev/null 2>&1; then
+    echo "Refusing to strip ${component_name}: linker ad-hoc signature removal failed." >&2
+    exit 1
+  fi
+}
+
 cleanup() {
   if [[ -n "${STAGING_DIR}" && -d "${STAGING_DIR}" ]]; then
     rm -rf -- "${STAGING_DIR}"
@@ -347,21 +375,15 @@ verify_dsym_matches_binary "${EXECUTABLE_PATH}" "${PRIVATE_DSYM_PATH}" "archived
 verify_dsym_matches_binary \
   "${NATIVE_HOST_EXECUTABLE_PATH}" "${PRIVATE_NATIVE_HOST_DSYM_PATH}" "archived native host"
 
-# Do not strip a signed Mach-O: it would invalidate the signature and risks
-# accidentally publishing a bundle whose signature no longer represents its
-# contents. SwiftPM output is intentionally unsigned; the staged copy is
-# stripped before the first signing operation below.
+# Do not strip identity-signed Mach-O input: it would invalidate the signature
+# and risk publishing a bundle whose signature no longer represents its
+# contents. A linker-generated, no-Team-ID ad-hoc signature is removed under a
+# strict allowlist; the staged copies are then stripped before release signing.
 STAGED_BINARY="${APP_DIR}/Contents/MacOS/${APP_NAME}"
 STAGED_NATIVE_HOST="${APP_DIR}/Contents/MacOS/${NATIVE_HOST_NAME}"
-if codesign --verify --strict "${STAGED_BINARY}" >/dev/null 2>&1; then
-  echo "Refusing to strip an already signed staged executable." >&2
-  exit 1
-fi
+remove_linker_adhoc_signature_before_strip "${STAGED_BINARY}" "staged executable"
 xcrun strip -S -x "${STAGED_BINARY}"
-if codesign --verify --strict "${STAGED_NATIVE_HOST}" >/dev/null 2>&1; then
-  echo "Refusing to strip an already signed staged native host." >&2
-  exit 1
-fi
+remove_linker_adhoc_signature_before_strip "${STAGED_NATIVE_HOST}" "staged native host"
 xcrun strip -S -x "${STAGED_NATIVE_HOST}"
 "${AUDIT_SCRIPT}" --tier "${ARTIFACT_TIER}" "${APP_DIR}"
 
