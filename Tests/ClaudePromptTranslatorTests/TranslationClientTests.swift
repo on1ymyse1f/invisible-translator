@@ -194,6 +194,13 @@ final class TranslationClientTests: XCTestCase {
                 at: start.addingTimeInterval(TimeInterval(offset)),
                 deliberateTargetWeight: 3
             )
+            profile = TranslationPreferenceLearningPolicy.record(
+                profile: profile,
+                sourceIdentifier: "zh",
+                targetLanguage: .english,
+                at: start.addingTimeInterval(TimeInterval(10 + offset)),
+                deliberateTargetWeight: 3
+            )
         }
         profile = TranslationPreferenceLearningPolicy.evaluated(
             profile: profile,
