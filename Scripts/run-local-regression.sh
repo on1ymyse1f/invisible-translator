@@ -89,7 +89,7 @@ wait_for_file() {
 
 screen_session_is_locked() {
   /usr/sbin/ioreg -n Root -d1 2>/dev/null \
-    | /usr/bin/grep -q '"CGSSessionScreenIsLocked"=Yes'
+    | /usr/bin/grep -F '"CGSSessionScreenIsLocked"=Yes' >/dev/null
 }
 
 field_value() {
