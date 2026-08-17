@@ -286,7 +286,7 @@ NOTARY_PROFILE="your-notarytool-profile" Scripts/create-dmg.sh
 
 - `Scripts/test.sh`：93/93 通过，覆盖回复链禁用剪贴板、同 PID Accessibility 快照、App 隐私名单、阻断期间取消、来源 App 窗口限定 OCR、字幕摘要缓存 TTL、X/Twitter 正文筛选、浏览器 AI host 白名单、同文不同轮次与长前缀流式回复失效。
 - `Scripts/run-local-regression.sh --ui --install`：SwiftPM/Xcode Release、签名与原子安装、精确 bundle 路径启动、运行时零 TCP/UDP socket 快照、离线合成 ChatGPT 输入/选区/回复、Apple 本地翻译、回复 OCR 禁用和剪贴板 change count 不变均通过。脱敏报告见 `review_artifacts/regression-20260809T032346Z.md`。
-- Computer Use 打开并核对了最终安装版 `/Users/chengwenbo/Applications/ClaudePromptTranslator.app` 的权限、回复 OCR 和不发送提示；真实 ChatGPT Classic 因自动化工具安全策略无法控制，Atlas 页面又未暴露可用的 composer Accessibility 节点，因此仍明确保留为不发送草稿的人工验收门。
+- Computer Use 打开并核对了最终安装版 `$HOME/Applications/ClaudePromptTranslator.app` 的权限、回复 OCR 和不发送提示；真实 ChatGPT Classic 因自动化工具安全策略无法控制，Atlas 页面又未暴露可用的 composer Accessibility 节点，因此仍明确保留为不发送草稿的人工验收门。
 
 ### 2026-08-07 本机验证
 

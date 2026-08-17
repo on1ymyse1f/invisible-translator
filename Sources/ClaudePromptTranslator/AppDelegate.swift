@@ -1503,61 +1503,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handleURL(_ url: URL) {
-        guard url.scheme == "claude-prompt-translator" else {
+        guard let action = URLActionRouter.action(for: url) else {
             return
         }
 
-        switch url.host {
-        case "translate":
+        switch action {
+        case .reveal:
+            model.revealEdgeBar()
+        case .guardedTranslate:
             model.statusMessage = "为避免误操作，链接只会打开边缘栏；请使用按钮或快捷键开始翻译。"
             model.revealEdgeBar()
-        case "show", "input":
-            model.revealEdgeBar()
-        case "english":
-            model.targetLanguage = .english
+        case .setLanguageAndReveal(let language):
+            model.targetLanguage = language
             model.revealEdgeBar()
             configureStatusItem()
-        case "japanese":
-            model.targetLanguage = .japanese
-            model.revealEdgeBar()
-            configureStatusItem()
-        default:
-            if url.path == "/show" || url.path == "/input" {
-                model.revealEdgeBar()
-            } else if url.path == "/translate" {
-                model.statusMessage = "为避免误操作，链接只会打开边缘栏；请使用按钮或快捷键开始翻译。"
-                model.revealEdgeBar()
-            }
         }
     }
 
     private func forwardURLToExistingInstance(_ url: URL) {
-        guard url.scheme == "claude-prompt-translator" else {
+        guard let action = URLActionRouter.action(for: url) else {
             return
         }
 
-        var userInfo: [String: String] = [:]
-        switch url.host {
-        case "translate":
-            userInfo["action"] = "show"
-        case "english":
-            userInfo["action"] = "show"
-            userInfo["language"] = TargetLanguage.english.rawValue
-        case "japanese":
-            userInfo["action"] = "show"
-            userInfo["language"] = TargetLanguage.japanese.rawValue
-        case "show", "input":
-            userInfo["action"] = "show"
-        default:
-            if url.path == "/translate" {
-                userInfo["action"] = "show"
-            } else if url.path == "/show" || url.path == "/input" {
-                userInfo["action"] = "show"
-            }
-        }
-
-        guard !userInfo.isEmpty else {
-            return
+        // Forwarding collapses every action to "show"; the guard message for
+        // translate links is only shown in the instance that receives the URL
+        // directly. Language switches carry the raw value alongside.
+        var userInfo: [String: String] = ["action": "show"]
+        if case .setLanguageAndReveal(let language) = action {
+            userInfo["language"] = language.rawValue
         }
 
         DistributedNotificationCenter.default().postNotificationName(

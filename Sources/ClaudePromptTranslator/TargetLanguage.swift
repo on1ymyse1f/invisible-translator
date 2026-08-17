@@ -31,11 +31,6 @@ enum TargetLanguage: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    /// Google accepts the BCP-47 region form used by the persisted raw value.
-    var googleLanguageCode: String {
-        rawValue
-    }
-
     /// Apple Translation models use the script identifier for Simplified Chinese.
     var appleLanguageCode: String {
         switch self {
