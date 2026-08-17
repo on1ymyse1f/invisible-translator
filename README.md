@@ -1,5 +1,24 @@
 # 无感翻译（ClaudePromptTranslator 0.8.1）
 
+> **English** — *Invisible Translator* is a privacy-first, local-only macOS selection translator.
+> Select text in any app, browser, or webpage; it reads the selection through the macOS
+> Accessibility APIs (never touching your clipboard by default), detects the language locally,
+> and shows a low-distraction translation overlay next to the selection. Translation runs
+> entirely on-device via Apple Translation (macOS 15+): there is **no telemetry, no cloud
+> fallback, and no code path that uploads your text**. Optional, explicitly-started pipelines
+> cover region OCR (ScreenCaptureKit + Vision), live video subtitles, and on-device speech
+> recognition. A Chromium companion extension bridges ChatGPT / Claude / X / YouTube pages
+> through a strictly validated, fail-closed native-messaging host. Password fields and
+> password-manager apps are excluded by design, and every capture requires explicit user
+> consent. `⌃⌥T` translates the current selection anywhere. MIT licensed.
+>
+> Requires macOS 15 or later. Build & test: `Scripts/test.sh`, full local regression:
+> `Scripts/run-local-regression.sh`. Public distribution still requires Developer ID
+> signing, notarization, and the store-listed extension — see
+> [docs/LIGHTWEIGHT_1_0_STATUS.md](docs/LIGHTWEIGHT_1_0_STATUS.md).
+>
+> 中文文档继续向下阅读 ↓
+
 一个原生 macOS 跨应用选区翻译工具。它的主流程已经从“只识别 AI 聊天输入框”调整为：
 
 系统要求：macOS 15 或更高版本（核心翻译使用 Apple Translation）。
